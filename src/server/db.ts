@@ -1,0 +1,392 @@
+import Database from 'better-sqlite3';
+import { mkdirSync } from 'node:fs';
+import path from 'node:path';
+import { randomUUID } from 'node:crypto';
+import type { Classification, ConversationRecord, DraftRecord, PullSetting, SloSummary, TriageItemRecord, TriageItemWithContext } from './types';
+import { buildDraft, classifyMessage, compareManualReply, makeExcerpt, sloMinutesFor } from './triage';
+
+const dbPath = process.env.TAUT_DB_PATH ?? path.resolve(process.cwd(), 'data', 'taut.db');
+mkdirSync(path.dirname(dbPath), { recursive: true });
+
+export const db = new Database(dbPath);
+db.pragma('journal_mode = WAL');
+db.pragma('foreign_keys = ON');
+
+export function migrate(): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS conversations (
+      id TEXT PRIMARY KEY,
+      slack_channel_id TEXT NOT NULL UNIQUE,
+      name TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      is_member INTEGER NOT NULL DEFAULT 1,
+      pull_setting TEXT NOT NULL DEFAULT 'pull_all' CHECK (pull_setting IN ('pull_all', 'mentions_only', 'disabled')),
+      preferences_json TEXT NOT NULL DEFAULT '{}',
+      last_pulled_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS triage_items (
+      id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+      slack_channel_id TEXT NOT NULL,
+      slack_ts TEXT NOT NULL,
+      thread_ts TEXT,
+      author TEXT NOT NULL,
+      author_id TEXT,
+      text TEXT NOT NULL,
+      excerpt TEXT NOT NULL,
+      permalink TEXT,
+      classification TEXT NOT NULL,
+      slo_minutes INTEGER NOT NULL,
+      due_at TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'replied', 'closed', 'discarded')),
+      created_at TEXT NOT NULL,
+      replied_at TEXT,
+      UNIQUE(slack_channel_id, slack_ts)
+    );
+
+    CREATE TABLE IF NOT EXISTS ai_drafts (
+      id TEXT PRIMARY KEY,
+      triage_item_id TEXT NOT NULL REFERENCES triage_items(id) ON DELETE CASCADE,
+      draft_text TEXT NOT NULL,
+      action_summary TEXT NOT NULL,
+      model TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS item_actions (
+      id TEXT PRIMARY KEY,
+      triage_item_id TEXT NOT NULL REFERENCES triage_items(id) ON DELETE CASCADE,
+      action_type TEXT NOT NULL,
+      payload_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS learning_deltas (
+      id TEXT PRIMARY KEY,
+      triage_item_id TEXT NOT NULL REFERENCES triage_items(id) ON DELETE CASCADE,
+      ai_draft TEXT NOT NULL,
+      manual_reply TEXT NOT NULL,
+      delta_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_triage_items_status_due ON triage_items(status, due_at);
+    CREATE INDEX IF NOT EXISTS idx_triage_items_classification ON triage_items(classification);
+    CREATE INDEX IF NOT EXISTS idx_actions_item ON item_actions(triage_item_id, created_at);
+  `);
+}
+
+export function getDbPath(): string {
+  return dbPath;
+}
+
+export function upsertConversation(input: {
+  slackChannelId: string;
+  name: string;
+  kind: string;
+  isMember: boolean;
+}): ConversationRecord {
+  const now = new Date().toISOString();
+  const existing = db.prepare('SELECT * FROM conversations WHERE slack_channel_id = ?').get(input.slackChannelId) as ConversationRecord | undefined;
+
+  if (existing) {
+    db.prepare(`
+      UPDATE conversations
+      SET name = @name, kind = @kind, is_member = @isMember, updated_at = @now
+      WHERE slack_channel_id = @slackChannelId
+    `).run({
+      name: input.name,
+      kind: input.kind,
+      isMember: input.isMember ? 1 : 0,
+      now,
+      slackChannelId: input.slackChannelId
+    });
+    return getConversationBySlackId(input.slackChannelId)!;
+  }
+
+  const id = randomUUID();
+  db.prepare(`
+    INSERT INTO conversations (id, slack_channel_id, name, kind, is_member, pull_setting, preferences_json, created_at, updated_at)
+    VALUES (@id, @slackChannelId, @name, @kind, @isMember, 'pull_all', '{}', @now, @now)
+  `).run({ id, slackChannelId: input.slackChannelId, name: input.name, kind: input.kind, isMember: input.isMember ? 1 : 0, now });
+
+  return getConversationBySlackId(input.slackChannelId)!;
+}
+
+export function getConversationBySlackId(slackChannelId: string): ConversationRecord | undefined {
+  return db.prepare('SELECT * FROM conversations WHERE slack_channel_id = ?').get(slackChannelId) as ConversationRecord | undefined;
+}
+
+export function listConversations(): ConversationRecord[] {
+  return db.prepare('SELECT * FROM conversations ORDER BY kind, name').all() as ConversationRecord[];
+}
+
+export function updateConversationPullSetting(conversationId: string, pullSetting: PullSetting): ConversationRecord {
+  const now = new Date().toISOString();
+  db.prepare('UPDATE conversations SET pull_setting = ?, updated_at = ? WHERE id = ?').run(pullSetting, now, conversationId);
+  const updated = db.prepare('SELECT * FROM conversations WHERE id = ?').get(conversationId) as ConversationRecord | undefined;
+  if (!updated) throw new Error(`Conversation not found: ${conversationId}`);
+  return updated;
+}
+
+export function markConversationPulled(conversationId: string): void {
+  const now = new Date().toISOString();
+  db.prepare('UPDATE conversations SET last_pulled_at = ?, updated_at = ? WHERE id = ?').run(now, now, conversationId);
+}
+
+export function createTriageItem(input: {
+  conversation: ConversationRecord;
+  slackTs: string;
+  threadTs: string | null;
+  author: string;
+  authorId: string | null;
+  text: string;
+  permalink: string | null;
+  isDirect: boolean;
+  mentionsUser: boolean;
+}): TriageItemRecord | null {
+  const exists = db.prepare('SELECT * FROM triage_items WHERE slack_channel_id = ? AND slack_ts = ?').get(input.conversation.slack_channel_id, input.slackTs) as TriageItemRecord | undefined;
+  if (exists) return null;
+
+  const classification = classifyMessage(input.text, { isDirect: input.isDirect, mentionsUser: input.mentionsUser });
+  const sloMinutes = sloMinutesFor(classification);
+  const createdAt = slackTsToIso(input.slackTs) ?? new Date().toISOString();
+  const dueAt = new Date(new Date(createdAt).getTime() + sloMinutes * 60_000).toISOString();
+  const id = randomUUID();
+  const excerpt = makeExcerpt(input.text);
+
+  db.prepare(`
+    INSERT INTO triage_items (
+      id, conversation_id, slack_channel_id, slack_ts, thread_ts, author, author_id, text, excerpt, permalink,
+      classification, slo_minutes, due_at, status, created_at
+    ) VALUES (
+      @id, @conversationId, @slackChannelId, @slackTs, @threadTs, @author, @authorId, @text, @excerpt, @permalink,
+      @classification, @sloMinutes, @dueAt, 'open', @createdAt
+    )
+  `).run({
+    id,
+    conversationId: input.conversation.id,
+    slackChannelId: input.conversation.slack_channel_id,
+    slackTs: input.slackTs,
+    threadTs: input.threadTs,
+    author: input.author,
+    authorId: input.authorId,
+    text: input.text,
+    excerpt,
+    permalink: input.permalink,
+    classification,
+    sloMinutes,
+    dueAt,
+    createdAt
+  });
+
+  const draft = buildDraft({ classification, text: input.text, sourceName: input.conversation.name });
+  createDraft(id, draft.draftText, draft.actionSummary, 'heuristic-v0');
+
+  return db.prepare('SELECT * FROM triage_items WHERE id = ?').get(id) as TriageItemRecord;
+}
+
+export function createDraft(triageItemId: string, draftText: string, actionSummary: string, model: string): DraftRecord {
+  const id = randomUUID();
+  const createdAt = new Date().toISOString();
+  db.prepare(`
+    INSERT INTO ai_drafts (id, triage_item_id, draft_text, action_summary, model, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(id, triageItemId, draftText, actionSummary, model, createdAt);
+  return db.prepare('SELECT * FROM ai_drafts WHERE id = ?').get(id) as DraftRecord;
+}
+
+export function getLatestDraft(triageItemId: string): DraftRecord | undefined {
+  return db.prepare('SELECT * FROM ai_drafts WHERE triage_item_id = ? ORDER BY created_at DESC LIMIT 1').get(triageItemId) as DraftRecord | undefined;
+}
+
+export function listItems(status = 'open'): TriageItemWithContext[] {
+  const where = status === 'all' ? '' : 'WHERE ti.status = @status';
+  return db.prepare(`
+    SELECT
+      ti.*,
+      c.name AS source_name,
+      c.kind AS source_kind,
+      c.pull_setting AS pull_setting,
+      d.id AS draft_id,
+      d.draft_text AS draft_text,
+      d.action_summary AS action_summary
+    FROM triage_items ti
+    JOIN conversations c ON c.id = ti.conversation_id
+    LEFT JOIN ai_drafts d ON d.id = (
+      SELECT id FROM ai_drafts WHERE triage_item_id = ti.id ORDER BY created_at DESC LIMIT 1
+    )
+    ${where}
+    ORDER BY
+      CASE WHEN ti.status = 'open' AND ti.due_at < @now THEN 0 ELSE 1 END,
+      ti.due_at ASC,
+      ti.created_at DESC
+    LIMIT 200
+  `).all({ status, now: new Date().toISOString() }) as TriageItemWithContext[];
+}
+
+export function getItem(id: string): TriageItemWithContext | undefined {
+  return db.prepare(`
+    SELECT
+      ti.*,
+      c.name AS source_name,
+      c.kind AS source_kind,
+      c.pull_setting AS pull_setting,
+      d.id AS draft_id,
+      d.draft_text AS draft_text,
+      d.action_summary AS action_summary
+    FROM triage_items ti
+    JOIN conversations c ON c.id = ti.conversation_id
+    LEFT JOIN ai_drafts d ON d.id = (
+      SELECT id FROM ai_drafts WHERE triage_item_id = ti.id ORDER BY created_at DESC LIMIT 1
+    )
+    WHERE ti.id = ?
+  `).get(id) as TriageItemWithContext | undefined;
+}
+
+export function recordAction(triageItemId: string, actionType: string, payload: unknown = {}): void {
+  db.prepare('INSERT INTO item_actions (id, triage_item_id, action_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)').run(
+    randomUUID(),
+    triageItemId,
+    actionType,
+    JSON.stringify(payload),
+    new Date().toISOString()
+  );
+}
+
+export function markItemStatus(triageItemId: string, status: 'replied' | 'closed' | 'discarded'): void {
+  const repliedAt = status === 'replied' ? new Date().toISOString() : null;
+  db.prepare('UPDATE triage_items SET status = ?, replied_at = COALESCE(?, replied_at) WHERE id = ?').run(status, repliedAt, triageItemId);
+}
+
+export function storeLearningDelta(triageItemId: string, aiDraft: string, manualReply: string): void {
+  db.prepare(`
+    INSERT INTO learning_deltas (id, triage_item_id, ai_draft, manual_reply, delta_json, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(randomUUID(), triageItemId, aiDraft, manualReply, compareManualReply(aiDraft, manualReply), new Date().toISOString());
+}
+
+export function computeSloSummary(): SloSummary {
+  const now = new Date().toISOString();
+  const rows = db.prepare(`
+    SELECT
+      classification,
+      COUNT(*) AS total,
+      SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) AS open,
+      SUM(CASE WHEN status = 'open' AND due_at < @now THEN 1 ELSE 0 END) AS overdue,
+      SUM(CASE WHEN status = 'replied' THEN 1 ELSE 0 END) AS replied,
+      SUM(CASE WHEN status = 'replied' AND replied_at <= due_at THEN 1 ELSE 0 END) AS replied_within_slo
+    FROM triage_items
+    GROUP BY classification
+    ORDER BY MIN(slo_minutes)
+  `).all({ now }) as Array<{
+    classification: Classification;
+    total: number;
+    open: number;
+    overdue: number;
+    replied: number;
+    replied_within_slo: number;
+  }>;
+
+  const buckets = rows.map((row) => ({
+    ...row,
+    replied_within_slo_percent: row.replied === 0 ? 0 : Math.round((row.replied_within_slo / row.replied) * 100)
+  }));
+
+  const totals = buckets.reduce(
+    (acc, bucket) => ({ replied: acc.replied + bucket.replied, within: acc.within + bucket.replied_within_slo }),
+    { replied: 0, within: 0 }
+  );
+
+  const openItems = listItems('open');
+  const overdueItems = openItems.filter((item) => item.due_at < now).slice(0, 20);
+  const agingQueue = openItems.slice(0, 20);
+
+  return {
+    now,
+    buckets,
+    overdueItems,
+    agingQueue,
+    repliedWithinSloPercent: totals.replied === 0 ? 0 : Math.round((totals.within / totals.replied) * 100)
+  };
+}
+
+export function seedDemoData(): void {
+  const now = Date.now();
+  const samples = [
+    {
+      channel: 'CDEMO1',
+      name: 'growth-personalisation',
+      kind: 'channel',
+      author: 'Maya',
+      text: '<@UROB> can you approve the experiment copy before EOD? We are blocked on the final variant.',
+      minutesAgo: 95,
+      isDirect: false,
+      mentionsUser: true
+    },
+    {
+      channel: 'DDEMO2',
+      name: 'Sam DM',
+      kind: 'im',
+      author: 'Sam',
+      text: 'I am stuck on the prompt selection rollout. Could you help decide whether we ship behind the new flag?',
+      minutesAgo: 70,
+      isDirect: true,
+      mentionsUser: false
+    },
+    {
+      channel: 'CDEMO3',
+      name: 'eng-leads',
+      kind: 'channel',
+      author: 'Priya',
+      text: 'FYI the metrics review moved to Thursday. No action needed, sharing for context.',
+      minutesAgo: 240,
+      isDirect: false,
+      mentionsUser: false
+    },
+    {
+      channel: 'CDEMO4',
+      name: 'product-feedback',
+      kind: 'channel',
+      author: 'Alex',
+      text: 'Can someone follow up on the customer thread and create a task for the missing location parameter?',
+      minutesAgo: 1500,
+      isDirect: false,
+      mentionsUser: false
+    },
+    {
+      channel: 'CDEMO5',
+      name: 'random',
+      kind: 'channel',
+      author: 'Jordan',
+      text: 'thanks!',
+      minutesAgo: 30,
+      isDirect: false,
+      mentionsUser: false
+    }
+  ];
+
+  for (const sample of samples) {
+    const conversation = upsertConversation({ slackChannelId: sample.channel, name: sample.name, kind: sample.kind, isMember: true });
+    createTriageItem({
+      conversation,
+      slackTs: String((now - sample.minutesAgo * 60_000) / 1000),
+      threadTs: null,
+      author: sample.author,
+      authorId: null,
+      text: sample.text,
+      permalink: `https://cleo-team.slack.com/archives/${sample.channel}/p${Math.trunc((now - sample.minutesAgo * 60_000) / 1000)}`,
+      isDirect: sample.isDirect,
+      mentionsUser: sample.mentionsUser
+    });
+  }
+}
+
+function slackTsToIso(ts: string): string | null {
+  const seconds = Number(ts.split('.')[0]);
+  if (!Number.isFinite(seconds)) return null;
+  return new Date(seconds * 1000).toISOString();
+}
