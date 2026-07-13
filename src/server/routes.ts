@@ -1,9 +1,10 @@
 import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { addSlackReaction, getSlackAuth, ingestSlack, postSlackReply } from './slack';
+import { addSlackReaction, getSlackAuth, ingestSlack, isSlackRateLimitError, postSlackReply } from './slack';
 import { buildSlackOAuthStartUrl, completeSlackOAuth, disconnectSlack, getSlackConnectionStatus, tautAppUrl } from './slack-oauth';
 import {
+  clearDemoData,
   computeSloSummary,
   getDbPath,
   getItem,
@@ -98,8 +99,13 @@ export function createApp(): express.Express {
     res.json({ ok: true, items: listItems('open'), slo: computeSloSummary() });
   });
 
+  app.post('/api/demo/clear', (_req, res) => {
+    const result = clearDemoData();
+    res.json({ ok: true, result, items: listItems('open'), conversations: listConversations(), slo: computeSloSummary() });
+  });
+
   app.post('/api/ingest/slack', asyncHandler(async (req, res) => {
-    const rawLimit = typeof req.body?.limitPerConversation === 'number' ? req.body.limitPerConversation : 10;
+    const rawLimit = typeof req.body?.limitPerConversation === 'number' ? req.body.limitPerConversation : 5;
     const result = await ingestSlack(rawLimit);
     res.json({ ok: true, result, items: listItems('open'), slo: computeSloSummary() });
   }));
@@ -172,6 +178,19 @@ export function createApp(): express.Express {
   });
 
   app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    if (isSlackRateLimitError(err)) {
+      res.set('Retry-After', String(err.retryAfterSeconds));
+      res.status(429).json({
+        ok: false,
+        code: err.code,
+        error: err.message,
+        retryAfterSeconds: err.retryAfterSeconds,
+        retryAt: err.retryAt,
+        slackMethod: err.method
+      });
+      return;
+    }
+
     const message = err instanceof Error ? err.message : 'Unknown error';
     res.status(500).json({ ok: false, error: message });
   });

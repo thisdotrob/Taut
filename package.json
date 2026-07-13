@@ -11,6 +11,7 @@
     "build": "tsc --noEmit && vite build",
     "start": "NODE_ENV=production tsx src/server/index.ts",
     "seed": "tsx src/server/cli.ts seed",
+    "clear-demo": "tsx src/server/cli.ts clear-demo",
     "ingest": "tsx src/server/cli.ts ingest",
     "socket": "tsx src/server/socket.ts",
     "dev:socket": "tsx watch src/server/socket.ts"

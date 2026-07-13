@@ -1,6 +1,6 @@
 import { ProxyAgent, setGlobalDispatcher } from 'undici';
 import type { ConversationRecord } from './types';
-import { createTriageItem, markConversationPulled, upsertConversation } from './db';
+import { createTriageItem, listConversations as listStoredConversations, markConversationPulled, upsertConversation } from './db';
 import { resolveSlackToken } from './slack-oauth';
 
 const proxyUrl = process.env.HTTPS_PROXY ?? process.env.HTTP_PROXY;
@@ -49,12 +49,16 @@ interface SlackAuth {
   token_source: string;
 }
 
+type ConversationListSource = 'slack' | 'cache' | 'stored';
+
 interface SlackIngestResult {
   auth: SlackAuth;
   conversationsSeen: number;
   conversationsPulled: number;
   itemsCreated: number;
   skippedByRule: number;
+  conversationListSource: ConversationListSource;
+  warnings: string[];
 }
 
 export interface SlackMessageEvent {
@@ -77,7 +81,38 @@ export interface SlackMessageEventIngestResult {
   itemId: string | null;
 }
 
+const DEFAULT_SLACK_RETRY_AFTER_SECONDS = 60;
+const DEFAULT_CONVERSATION_CACHE_TTL_SECONDS = 10 * 60;
+const DEFAULT_AUTH_CACHE_TTL_SECONDS = 5 * 60;
+
+const rateLimitedUntilByMethod = new Map<string, number>();
+let conversationListCache: { conversations: SlackConversation[]; fetchedAtMs: number } | null = null;
+let slackAuthCache: { auth: SlackAuth; token: string; fetchedAtMs: number } | null = null;
+
+export class SlackRateLimitError extends Error {
+  readonly code = 'slack_ratelimited';
+  readonly method: string;
+  readonly retryAfterSeconds: number;
+  readonly retryAt: string;
+
+  constructor(method: string, retryAfterSeconds: number) {
+    const seconds = Math.max(1, Math.ceil(retryAfterSeconds));
+    super(`Slack rate limited; retry after ${seconds} second${seconds === 1 ? '' : 's'}.`);
+    this.name = 'SlackRateLimitError';
+    this.method = method;
+    this.retryAfterSeconds = seconds;
+    this.retryAt = new Date(Date.now() + seconds * 1_000).toISOString();
+  }
+}
+
+export function isSlackRateLimitError(error: unknown): error is SlackRateLimitError {
+  return error instanceof SlackRateLimitError;
+}
+
 export async function slackApi<T>(method: string, params: Record<string, string | number | boolean | undefined> = {}, httpMethod: 'GET' | 'POST' = 'GET'): Promise<T> {
+  const existingRetryAfter = retryAfterFor(method);
+  if (existingRetryAfter) throw new SlackRateLimitError(method, existingRetryAfter);
+
   const url = new URL(`https://slack.com/api/${method}`);
   const bodyParams = new URLSearchParams();
   const resolvedToken = resolveSlackToken();
@@ -99,7 +134,18 @@ export async function slackApi<T>(method: string, params: Record<string, string 
     body: httpMethod === 'POST' ? bodyParams : undefined
   });
 
-  const payload = (await response.json()) as SlackApiResponse<T>;
+  const payload = await parseSlackPayload<T>(response);
+  if (response.status === 429 || payload.error === 'ratelimited') {
+    const retryAfterSeconds = parseRetryAfterSeconds(response.headers.get('retry-after')) ?? DEFAULT_SLACK_RETRY_AFTER_SECONDS;
+    rememberRateLimit(method, retryAfterSeconds);
+    throw new SlackRateLimitError(method, retryAfterSeconds);
+  }
+
+  if (!response.ok) {
+    const detail = payload.error ?? `HTTP ${response.status}`;
+    throw new Error(`Slack API ${method} failed: ${detail}`);
+  }
+
   if (!payload.ok) {
     const detail = payload.error ?? `HTTP ${response.status}`;
     throw new Error(`Slack API ${method} failed: ${detail}`);
@@ -110,8 +156,15 @@ export async function slackApi<T>(method: string, params: Record<string, string 
 
 export async function getSlackAuth(): Promise<SlackAuth> {
   const resolvedToken = resolveSlackToken();
+  const cached = slackAuthCache;
+  if (cached && cached.token === resolvedToken.token && Date.now() - cached.fetchedAtMs < authCacheTtlMs()) {
+    return cached.auth;
+  }
+
   const payload = await slackApi<SlackApiResponse<SlackAuth> & SlackAuth>('auth.test');
-  return { user_id: payload.user_id, user: payload.user, team: payload.team, url: payload.url, token_source: resolvedToken.source };
+  const auth = { user_id: payload.user_id, user: payload.user, team: payload.team, url: payload.url, token_source: resolvedToken.source };
+  slackAuthCache = { auth, token: resolvedToken.token, fetchedAtMs: Date.now() };
+  return auth;
 }
 
 export async function postSlackReply(input: { channel: string; threadTs: string | null; text: string }): Promise<{ ts: string }> {
@@ -132,9 +185,10 @@ export async function addSlackReaction(input: { channel: string; timestamp: stri
   await slackApi('reactions.add', { channel: input.channel, timestamp: input.timestamp, name: cleanEmoji }, 'POST');
 }
 
-export async function ingestSlack(limitPerConversation = 10): Promise<SlackIngestResult> {
+export async function ingestSlack(limitPerConversation = 5): Promise<SlackIngestResult> {
   const auth = await getSlackAuth();
-  const conversations = await listSlackConversations();
+  const conversationList = await conversationsForIngestion();
+  const conversations = conversationList.conversations;
   let conversationsPulled = 0;
   let itemsCreated = 0;
   let skippedByRule = 0;
@@ -177,7 +231,15 @@ export async function ingestSlack(limitPerConversation = 10): Promise<SlackInges
     markConversationPulled(conversation.id);
   }
 
-  return { auth, conversationsSeen: conversations.length, conversationsPulled, itemsCreated, skippedByRule };
+  return {
+    auth,
+    conversationsSeen: conversations.length,
+    conversationsPulled,
+    itemsCreated,
+    skippedByRule,
+    conversationListSource: conversationList.source,
+    warnings: conversationList.warnings
+  };
 }
 
 export async function ingestSlackMessageEvent(message: SlackMessageEvent): Promise<SlackMessageEventIngestResult> {
@@ -218,23 +280,84 @@ export async function ingestSlackMessageEvent(message: SlackMessageEvent): Promi
   return { created: true, skipped: false, reason: 'created', itemId: created.id };
 }
 
-async function listSlackConversations(): Promise<SlackConversation[]> {
+async function conversationsForIngestion(): Promise<{ conversations: SlackConversation[]; source: ConversationListSource; warnings: string[] }> {
+  const freshCached = freshConversationListCache();
+  if (freshCached) return { conversations: freshCached, source: 'cache', warnings: [] };
+
+  try {
+    const result = await fetchSlackConversations();
+    if (result.conversations.length > 0) {
+      conversationListCache = { conversations: result.conversations, fetchedAtMs: Date.now() };
+    }
+    return { ...result, source: 'slack' };
+  } catch (error) {
+    if (isSlackRateLimitError(error)) {
+      if (conversationListCache?.conversations.length) {
+        return {
+          conversations: conversationListCache.conversations,
+          source: 'cache',
+          warnings: [`${error.message} Using cached Slack conversation list instead of calling conversations.list again.`]
+        };
+      }
+
+      const storedConversations = listStoredConversations().map(storedConversationToSlackConversation);
+      if (storedConversations.length > 0) {
+        return {
+          conversations: storedConversations,
+          source: 'stored',
+          warnings: [`${error.message} Using conversations already stored in Taut until Slack allows conversations.list again.`]
+        };
+      }
+    }
+    throw error;
+  }
+}
+
+async function fetchSlackConversations(): Promise<{ conversations: SlackConversation[]; warnings: string[] }> {
   const conversations: SlackConversation[] = [];
+  const warnings: string[] = [];
   let cursor = '';
 
   do {
-    const payload = await slackApi<SlackApiResponse<{ channels: SlackConversation[] }> & { channels: SlackConversation[] }>('conversations.list', {
-      types: 'public_channel,private_channel,im,mpim',
-      exclude_archived: true,
-      limit: 200,
-      cursor: cursor || undefined
-    });
+    try {
+      const payload = await slackApi<SlackApiResponse<{ channels: SlackConversation[] }> & { channels: SlackConversation[] }>('conversations.list', {
+        types: 'public_channel,private_channel,im,mpim',
+        exclude_archived: true,
+        limit: 200,
+        cursor: cursor || undefined
+      });
 
-    conversations.push(...payload.channels.filter((conversation) => conversation.is_member || conversation.is_im || conversation.is_mpim));
-    cursor = payload.response_metadata?.next_cursor ?? '';
+      conversations.push(...payload.channels.filter((conversation) => conversation.is_member || conversation.is_im || conversation.is_mpim));
+      cursor = payload.response_metadata?.next_cursor ?? '';
+    } catch (error) {
+      if (isSlackRateLimitError(error) && conversations.length > 0) {
+        warnings.push(`${error.message} Continuing with ${conversations.length} conversations fetched before Slack paused conversations.list.`);
+        break;
+      }
+      throw error;
+    }
   } while (cursor);
 
-  return conversations;
+  return { conversations, warnings };
+}
+
+function freshConversationListCache(): SlackConversation[] | null {
+  if (!conversationListCache) return null;
+  if (Date.now() - conversationListCache.fetchedAtMs > conversationCacheTtlMs()) return null;
+  return conversationListCache.conversations;
+}
+
+function storedConversationToSlackConversation(conversation: ConversationRecord): SlackConversation {
+  return {
+    id: conversation.slack_channel_id,
+    name: conversation.name,
+    is_member: Boolean(conversation.is_member),
+    is_channel: conversation.kind === 'channel',
+    is_group: conversation.kind === 'private_channel',
+    is_im: conversation.kind === 'im',
+    is_mpim: conversation.kind === 'mpim',
+    is_private: conversation.kind === 'private_channel'
+  };
 }
 
 async function conversationHistory(channel: string, limit: number): Promise<SlackMessage[]> {
@@ -266,6 +389,55 @@ async function getConversationInfo(channel: string): Promise<SlackConversation |
   } catch {
     return null;
   }
+}
+
+async function parseSlackPayload<T>(response: Response): Promise<SlackApiResponse<T>> {
+  const text = await response.text();
+  if (!text) return { ok: response.ok } as SlackApiResponse<T>;
+
+  try {
+    return JSON.parse(text) as SlackApiResponse<T>;
+  } catch {
+    return { ok: response.ok, error: `HTTP ${response.status}` } as SlackApiResponse<T>;
+  }
+}
+
+function parseRetryAfterSeconds(value: string | null): number | null {
+  if (!value) return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return Math.ceil(parsed);
+}
+
+function rememberRateLimit(method: string, retryAfterSeconds: number): void {
+  rateLimitedUntilByMethod.set(method, Date.now() + Math.max(1, Math.ceil(retryAfterSeconds)) * 1_000);
+}
+
+function retryAfterFor(method: string): number | null {
+  const until = rateLimitedUntilByMethod.get(method);
+  if (!until) return null;
+  const remainingMs = until - Date.now();
+  if (remainingMs <= 0) {
+    rateLimitedUntilByMethod.delete(method);
+    return null;
+  }
+  return Math.ceil(remainingMs / 1_000);
+}
+
+function conversationCacheTtlMs(): number {
+  return secondsEnv('TAUT_CONVERSATION_CACHE_TTL_SECONDS', DEFAULT_CONVERSATION_CACHE_TTL_SECONDS) * 1_000;
+}
+
+function authCacheTtlMs(): number {
+  return secondsEnv('TAUT_AUTH_CACHE_TTL_SECONDS', DEFAULT_AUTH_CACHE_TTL_SECONDS) * 1_000;
+}
+
+function secondsEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+  return parsed;
 }
 
 function shouldIngestMessage(message: SlackMessage, currentUserId: string, conversation: ConversationRecord): boolean {

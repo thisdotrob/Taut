@@ -14,12 +14,23 @@ Taut is a lightweight AI triage feed for Slack. It intentionally avoids cloning 
 ```bash
 pnpm install
 pnpm seed      # optional: seed demo triage items
+pnpm clear-demo # remove only seeded demo items/conversations
 pnpm dev
 ```
 
 Open http://localhost:5173.
 
 The API runs on http://localhost:8787 by default and Vite proxies `/api/*` to the same `TAUT_API_PORT`/`PORT`.
+
+## Demo data
+
+Demo rows are only created by the **Seed demo** UI button or `pnpm seed`; Taut does not seed demo data on startup and the SQLite DB is gitignored. If old demo rows appear, they are likely from a previously used local `data/taut.db` or a `TAUT_DB_PATH` pointing at an older DB.
+
+Demo Slack IDs use prefixes such as `CDEMO*`, `DDEMO*`, `GDEMO*`, or `MDEMO*`. They deliberately do not render real Slack permalinks. To remove only demo data while preserving Slack OAuth/install settings and real Slack-ingested items, click **Clear demo** in the UI or run:
+
+```bash
+pnpm clear-demo
+```
 
 ## Slack Socket Mode for near-real-time events
 

@@ -69,6 +69,14 @@ interface ToastState {
   message: string;
 }
 
+interface ApiErrorPayload {
+  ok?: boolean;
+  error?: string;
+  code?: string;
+  retryAfterSeconds?: number;
+  retryAt?: string;
+}
+
 interface SlackConnectionStatus {
   connected: boolean;
   configured: boolean;
@@ -99,12 +107,24 @@ function App(): React.ReactElement {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
   const [toast, setToast] = useState<ToastState | null>(null);
+  const [pullRetryAt, setPullRetryAt] = useState<string | null>(null);
+  const [nowMs, setNowMs] = useState(() => Date.now());
   const [draftEdits, setDraftEdits] = useState<Record<string, string>>({});
   const [manualReplies, setManualReplies] = useState<Record<string, string>>({});
 
   useEffect(() => {
     void refresh();
   }, [statusFilter]);
+
+  useEffect(() => {
+    if (!pullRetryAt) return;
+    const interval = window.setInterval(() => setNowMs(Date.now()), 1_000);
+    return () => window.clearInterval(interval);
+  }, [pullRetryAt]);
+
+  useEffect(() => {
+    if (pullRetryAt && new Date(pullRetryAt).getTime() <= nowMs) setPullRetryAt(null);
+  }, [pullRetryAt, nowMs]);
 
   async function refresh(): Promise<void> {
     setLoading(true);
@@ -139,19 +159,37 @@ function App(): React.ReactElement {
     }
   }
 
+  async function clearDemo(): Promise<void> {
+    setBusy('clear-demo');
+    try {
+      const response = await api<{ result: { itemsDeleted: number; conversationsDeleted: number } }>('/api/demo/clear', { method: 'POST' });
+      setToast({ kind: 'success', message: `Cleared ${response.result.itemsDeleted} demo items and ${response.result.conversationsDeleted} demo conversations.` });
+      await refresh();
+    } catch (error) {
+      showError(error);
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function ingestSlack(): Promise<void> {
     setBusy('ingest');
     try {
-      const result = await api<{ result: { conversationsSeen: number; itemsCreated: number } }>('/api/ingest/slack', {
+      const result = await api<{ result: { conversationsSeen: number; itemsCreated: number; warnings?: string[] } }>('/api/ingest/slack', {
         method: 'POST',
-        body: JSON.stringify({ limitPerConversation: 10 })
+        body: JSON.stringify({ limitPerConversation: 5 })
       });
+      setPullRetryAt(null);
+      const warning = result.result.warnings?.length ? ` ${result.result.warnings.join(' ')}` : '';
       setToast({
-        kind: 'success',
-        message: `Pulled ${result.result.conversationsSeen} Slack conversations and created ${result.result.itemsCreated} triage items.`
+        kind: warning ? 'info' : 'success',
+        message: `Pulled ${result.result.conversationsSeen} Slack conversations and created ${result.result.itemsCreated} triage items.${warning}`
       });
       await refresh();
     } catch (error) {
+      if (error instanceof ApiError && error.code === 'slack_ratelimited') {
+        setPullRetryAt(error.retryAt ?? new Date(Date.now() + (error.retryAfterSeconds ?? 60) * 1_000).toISOString());
+      }
       showError(error);
     } finally {
       setBusy(null);
@@ -202,6 +240,8 @@ function App(): React.ReactElement {
   }
 
   const openItems = useMemo(() => items.filter((item) => item.status === 'open'), [items]);
+  const pullRetrySeconds = pullRetryAt ? Math.max(0, Math.ceil((new Date(pullRetryAt).getTime() - nowMs) / 1_000)) : 0;
+  const pullSlackDisabled = busy === 'ingest' || slackConnection?.connected === false || pullRetrySeconds > 0;
 
   return (
     <main className="app-shell">
@@ -214,11 +254,14 @@ function App(): React.ReactElement {
           </p>
         </div>
         <div className="hero-actions" aria-label="Data controls">
-          <button type="button" className="primary" onClick={() => void ingestSlack()} disabled={busy === 'ingest' || slackConnection?.connected === false}>
-            {busy === 'ingest' ? 'Pulling Slack…' : 'Pull Slack'}
+          <button type="button" className="primary" onClick={() => void ingestSlack()} disabled={pullSlackDisabled}>
+            {busy === 'ingest' ? 'Pulling Slack…' : pullRetrySeconds > 0 ? `Retry in ${pullRetrySeconds}s` : 'Pull Slack'}
           </button>
           <button type="button" className="secondary" onClick={() => void seedDemo()} disabled={busy === 'seed'}>
             {busy === 'seed' ? 'Seeding…' : 'Seed demo'}
+          </button>
+          <button type="button" className="ghost" onClick={() => void clearDemo()} disabled={busy === 'clear-demo'}>
+            {busy === 'clear-demo' ? 'Clearing…' : 'Clear demo'}
           </button>
           <button type="button" className="ghost" onClick={() => void refresh()} disabled={loading}>
             Refresh
@@ -417,7 +460,7 @@ function App(): React.ReactElement {
                       Open in Slack
                     </a>
                   ) : (
-                    <span className="muted">No Slack permalink</span>
+                    <span className="muted">{isDemoSlackId(item.slack_channel_id) ? 'Demo item — no Slack link' : 'No Slack permalink'}</span>
                   )}
                 </footer>
               </article>
@@ -439,14 +482,34 @@ function MetricCard(props: { label: string; value: string; hint: string; tone?: 
   );
 }
 
+class ApiError extends Error {
+  readonly status: number;
+  readonly code?: string;
+  readonly retryAfterSeconds?: number;
+  readonly retryAt?: string;
+
+  constructor(message: string, status: number, payload: ApiErrorPayload) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.code = payload.code;
+    this.retryAfterSeconds = payload.retryAfterSeconds;
+    this.retryAt = payload.retryAt;
+  }
+}
+
 async function api<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
     headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) },
     ...init
   });
-  const payload = (await response.json()) as T & { ok?: boolean; error?: string };
-  if (!response.ok || payload.ok === false) throw new Error(payload.error ?? `Request failed: ${response.status}`);
+  const payload = (await response.json()) as T & ApiErrorPayload;
+  if (!response.ok || payload.ok === false) throw new ApiError(payload.error ?? `Request failed: ${response.status}`, response.status, payload);
   return payload;
+}
+
+function isDemoSlackId(slackChannelId: string): boolean {
+  return /^[CDGM]DEMO/.test(slackChannelId);
 }
 
 function kindLabel(kind: string): string {

@@ -106,6 +106,10 @@ export function migrate(): void {
     CREATE INDEX IF NOT EXISTS idx_triage_items_classification ON triage_items(classification);
     CREATE INDEX IF NOT EXISTS idx_actions_item ON item_actions(triage_item_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_slack_oauth_states_expires ON slack_oauth_states(expires_at);
+
+    UPDATE triage_items
+    SET permalink = NULL
+    WHERE slack_channel_id GLOB '[CDGM]DEMO*';
   `);
 }
 
@@ -398,6 +402,12 @@ export function computeSloSummary(): SloSummary {
   };
 }
 
+export function clearDemoData(): { conversationsDeleted: number; itemsDeleted: number } {
+  const itemRow = db.prepare("SELECT COUNT(*) AS count FROM triage_items WHERE slack_channel_id GLOB '[CDGM]DEMO*'").get() as { count: number };
+  const conversationResult = db.prepare("DELETE FROM conversations WHERE slack_channel_id GLOB '[CDGM]DEMO*'").run();
+  return { conversationsDeleted: conversationResult.changes, itemsDeleted: itemRow.count };
+}
+
 export function seedDemoData(): void {
   const now = Date.now();
   const samples = [
@@ -462,7 +472,7 @@ export function seedDemoData(): void {
       author: sample.author,
       authorId: null,
       text: sample.text,
-      permalink: `https://cleo-team.slack.com/archives/${sample.channel}/p${Math.trunc((now - sample.minutesAgo * 60_000) / 1000)}`,
+      permalink: null,
       isDirect: sample.isDirect,
       mentionsUser: sample.mentionsUser
     });
