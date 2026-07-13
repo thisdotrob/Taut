@@ -9,6 +9,13 @@ export type Classification =
 
 export type ItemStatus = 'open' | 'replied' | 'closed' | 'discarded';
 
+export interface ThreadContextMessage {
+  ts: string;
+  author: string;
+  author_id: string | null;
+  text: string;
+}
+
 export interface ConversationRecord {
   id: string;
   slack_channel_id: string;
@@ -39,6 +46,7 @@ export interface TriageItemRecord {
   thread_ts: string | null;
   author: string;
   author_id: string | null;
+  thread_context: ThreadContextMessage[] | null;
   text: string;
   excerpt: string;
   permalink: string | null;

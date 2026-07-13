@@ -19,6 +19,7 @@ interface TriageItem {
   thread_ts: string | null;
   author: string;
   author_id: string | null;
+  thread_context: ThreadContextMessage[] | null;
   text: string;
   excerpt: string;
   permalink: string | null;
@@ -68,6 +69,13 @@ interface SystemStatus {
   llm: LlmStatus;
   socketMode: SocketModeStatus;
   slackRateLimits: Array<{ method: string; retryAfterSeconds: number; retryAt: string }>;
+}
+
+interface ThreadContextMessage {
+  ts: string;
+  author: string;
+  author_id: string | null;
+  text: string;
 }
 
 interface Conversation {
@@ -519,6 +527,23 @@ function App(): React.ReactElement {
                     <p className="excerpt">{item.excerpt}</p>
                   </div>
                 </div>
+
+                {item.thread_context && item.thread_context.length > 0 ? (
+                  <section className="thread-context" aria-label={`Earlier messages in this thread, ${item.thread_context.length} messages`}>
+                    <p className="thread-context-label">Earlier in this thread</p>
+                    <ol>
+                      {item.thread_context.map((message) => (
+                        <li key={message.ts}>
+                          <div className="thread-avatar" aria-hidden="true">{initials(message.author)}</div>
+                          <div>
+                            <p className="thread-author">{message.author}</p>
+                            <p className="thread-text">{message.text}</p>
+                          </div>
+                        </li>
+                      ))}
+                    </ol>
+                  </section>
+                ) : null}
 
                 <dl className="item-details">
                   <div>

@@ -10,6 +10,7 @@ import type {
   PullSetting,
   SlackConnectionRecord,
   SloSummary,
+  ThreadContextMessage,
   TriageItemRecord,
   TriageItemWithContext
 } from './types';
@@ -46,6 +47,7 @@ export function migrate(): void {
       thread_ts TEXT,
       author TEXT NOT NULL,
       author_id TEXT,
+      thread_context_json TEXT,
       text TEXT NOT NULL,
       excerpt TEXT NOT NULL,
       permalink TEXT,
@@ -139,6 +141,7 @@ export function migrate(): void {
   `);
 
   ensureColumn('conversations', 'last_seen_slack_ts', 'TEXT');
+  ensureColumn('triage_items', 'thread_context_json', 'TEXT');
   ensureColumn('triage_items', 'classification_rationale', 'TEXT');
   ensureColumn('triage_items', 'triage_model', 'TEXT');
   ensureColumn('triage_items', 'triage_prompt_version', 'TEXT');
@@ -326,6 +329,7 @@ export function createTriageItem(input: {
   threadTs: string | null;
   author: string;
   authorId: string | null;
+  threadContext?: ThreadContextMessage[] | null;
   text: string;
   permalink: string | null;
   isDirect: boolean;
@@ -334,7 +338,14 @@ export function createTriageItem(input: {
   contextSnapshot?: unknown;
 }): TriageItemRecord | null {
   const exists = db.prepare('SELECT * FROM triage_items WHERE slack_channel_id = ? AND slack_ts = ?').get(input.conversation.slack_channel_id, input.slackTs) as TriageItemRecord | undefined;
-  if (exists) return null;
+  if (exists) {
+    updateTriageItemSlackContext(exists.id, {
+      author: input.author,
+      authorId: input.authorId,
+      threadContext: input.threadContext
+    });
+    return null;
+  }
 
   const triage = input.triage ?? heuristicTriage({
     text: input.text,
@@ -352,10 +363,10 @@ export function createTriageItem(input: {
 
   db.prepare(`
     INSERT INTO triage_items (
-      id, conversation_id, slack_channel_id, slack_ts, thread_ts, author, author_id, text, excerpt, permalink,
+      id, conversation_id, slack_channel_id, slack_ts, thread_ts, author, author_id, thread_context_json, text, excerpt, permalink,
       classification, classification_rationale, triage_model, triage_prompt_version, context_snapshot_json, slo_minutes, due_at, status, created_at
     ) VALUES (
-      @id, @conversationId, @slackChannelId, @slackTs, @threadTs, @author, @authorId, @text, @excerpt, @permalink,
+      @id, @conversationId, @slackChannelId, @slackTs, @threadTs, @author, @authorId, @threadContextJson, @text, @excerpt, @permalink,
       @classification, @classificationRationale, @triageModel, @triagePromptVersion, @contextSnapshotJson, @sloMinutes, @dueAt, 'open', @createdAt
     )
   `).run({
@@ -366,6 +377,7 @@ export function createTriageItem(input: {
     threadTs: input.threadTs,
     author: input.author,
     authorId: input.authorId,
+    threadContextJson: input.threadContext === undefined ? null : JSON.stringify(input.threadContext),
     text: input.text,
     excerpt,
     permalink: input.permalink,
@@ -386,6 +398,32 @@ export function createTriageItem(input: {
   });
 
   return db.prepare('SELECT * FROM triage_items WHERE id = ?').get(id) as TriageItemRecord;
+}
+
+export function updateTriageItemSlackContext(id: string, input: {
+  author?: string;
+  authorId?: string | null;
+  threadContext?: ThreadContextMessage[] | null;
+}): void {
+  const existing = db.prepare('SELECT author, author_id, thread_context_json FROM triage_items WHERE id = ?').get(id) as {
+    author: string;
+    author_id: string | null;
+    thread_context_json: string | null;
+  } | undefined;
+  if (!existing) return;
+
+  db.prepare(`
+    UPDATE triage_items
+    SET author = @author,
+        author_id = @authorId,
+        thread_context_json = @threadContextJson
+    WHERE id = @id
+  `).run({
+    id,
+    author: input.author ?? existing.author,
+    authorId: input.authorId === undefined ? existing.author_id : input.authorId,
+    threadContextJson: input.threadContext === undefined ? existing.thread_context_json : JSON.stringify(input.threadContext)
+  });
 }
 
 export function createDraft(
@@ -434,11 +472,11 @@ export function listItems(status = 'open'): TriageItemWithContext[] {
       ti.due_at ASC,
       ti.created_at DESC
     LIMIT 200
-  `).all({ status, now: new Date().toISOString() }) as TriageItemWithContext[];
+  `).all({ status, now: new Date().toISOString() }).map(hydrateThreadContext) as TriageItemWithContext[];
 }
 
 export function getItem(id: string): TriageItemWithContext | undefined {
-  return db.prepare(`
+  const row = db.prepare(`
     SELECT
       ti.*,
       c.name AS source_name,
@@ -456,7 +494,23 @@ export function getItem(id: string): TriageItemWithContext | undefined {
       SELECT id FROM ai_drafts WHERE triage_item_id = ti.id ORDER BY created_at DESC LIMIT 1
     )
     WHERE ti.id = ?
-  `).get(id) as TriageItemWithContext | undefined;
+  `).get(id);
+  return row ? hydrateThreadContext(row) as TriageItemWithContext : undefined;
+}
+
+function hydrateThreadContext(row: unknown): unknown {
+  const item = row as Record<string, unknown>;
+  const rawContext = item.thread_context_json;
+  let threadContext: ThreadContextMessage[] | null = null;
+  if (typeof rawContext === 'string') {
+    try {
+      threadContext = JSON.parse(rawContext) as ThreadContextMessage[];
+    } catch {
+      threadContext = [];
+    }
+  }
+  const { thread_context_json: _threadContextJson, ...rest } = item;
+  return { ...rest, thread_context: threadContext };
 }
 
 export function recordAction(triageItemId: string, actionType: string, payload: unknown = {}): void {

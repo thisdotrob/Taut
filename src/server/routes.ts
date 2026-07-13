@@ -1,7 +1,7 @@
 import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { addSlackReaction, getSlackAuth, ingestSlack, isSlackRateLimitError, postSlackReply } from './slack';
+import { addSlackReaction, getSlackAuth, hydrateStoredSlackItems, ingestSlack, isSlackRateLimitError, postSlackReply } from './slack';
 import { getSystemStatus } from './status';
 import { buildSlackOAuthStartUrl, completeSlackOAuth, disconnectSlack, getSlackConnectionStatus, tautAppUrl } from './slack-oauth';
 import {
@@ -89,10 +89,12 @@ export function createApp(): express.Express {
     res.json({ ok: true });
   });
 
-  app.get('/api/items', (req, res) => {
+  app.get('/api/items', asyncHandler(async (req, res) => {
     const status = typeof req.query.status === 'string' ? req.query.status : 'open';
+    const items = listItems(status);
+    await hydrateStoredSlackItems(items);
     res.json(listItems(status));
-  });
+  }));
 
   app.get('/api/conversations', (_req, res) => {
     res.json(listConversationSources());

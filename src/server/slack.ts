@@ -1,5 +1,5 @@
 import { ProxyAgent, setGlobalDispatcher } from 'undici';
-import type { ConversationRecord, TriageItemRecord } from './types';
+import type { ConversationRecord, ThreadContextMessage, TriageItemRecord, TriageItemWithContext } from './types';
 import {
   createTriageItem,
   isThreadSuppressed,
@@ -7,6 +7,7 @@ import {
   listRecentLearningSignals,
   markConversationPulled,
   markTriageItemDeletedFromSlack,
+  updateTriageItemSlackContext,
   updateTriageItemFromSlack,
   upsertConversation
 } from './db';
@@ -51,6 +52,16 @@ interface SlackMessage {
   channel?: string;
   channel_type?: string;
   reply_count?: number;
+}
+
+interface SlackUser {
+  id: string;
+  name?: string;
+  real_name?: string;
+  profile?: {
+    display_name?: string;
+    real_name?: string;
+  };
 }
 
 interface SlackAuth {
@@ -117,6 +128,8 @@ const DEFAULT_AUTH_CACHE_TTL_SECONDS = 5 * 60;
 const rateLimitedUntilByMethod = new Map<string, number>();
 let conversationListCache: { conversations: SlackConversation[]; fetchedAtMs: number } | null = null;
 let slackAuthCache: { auth: SlackAuth; token: string; fetchedAtMs: number } | null = null;
+const slackUserNameCache = new Map<string, string>();
+const slackUserNameRequests = new Map<string, Promise<string>>();
 
 export class SlackRateLimitError extends Error {
   readonly code = 'slack_ratelimited';
@@ -320,8 +333,12 @@ async function createItemFromSlackMessage(conversation: ConversationRecord, mess
   const threadTs = message.thread_ts ?? message.ts;
   if (isThreadSuppressed(conversation.slack_channel_id, threadTs)) return null;
 
-  const permalink = await getPermalink(conversation.slack_channel_id, message.ts);
-  const contextSnapshot = await buildContextSnapshot(conversation, message);
+  const [permalink, author, threadContext, contextSnapshot] = await Promise.all([
+    getPermalink(conversation.slack_channel_id, message.ts),
+    resolveSlackUserName(message.user, message.username),
+    getThreadContext(conversation.slack_channel_id, message),
+    buildContextSnapshot(conversation, message)
+  ]);
   const triage = await generateTriageDecision({
     text: message.text,
     sourceName: conversation.name,
@@ -336,8 +353,9 @@ async function createItemFromSlackMessage(conversation: ConversationRecord, mess
     conversation,
     slackTs: message.ts,
     threadTs,
-    author: message.username ?? message.user ?? 'unknown',
+    author,
     authorId: message.user ?? null,
+    threadContext,
     text: message.text,
     permalink,
     isDirect: conversation.kind === 'im' || conversation.kind === 'mpim',
@@ -381,6 +399,35 @@ async function buildContextSnapshot(conversation: ConversationRecord, message: S
     warnings,
     fetchedAt: new Date().toISOString()
   };
+}
+
+export async function hydrateStoredSlackItems(items: TriageItemWithContext[]): Promise<void> {
+  for (const item of items) {
+    if (item.slack_channel_id.includes('DEMO')) continue;
+    const needsAuthor = Boolean(item.author_id && (item.author === item.author_id || /^U[A-Z0-9]+$/.test(item.author)));
+    const needsThreadContext = Boolean(item.thread_ts && item.thread_ts !== item.slack_ts && item.thread_context === null);
+    if (!needsAuthor && !needsThreadContext) continue;
+
+    let author: string | undefined;
+    let threadContext: ThreadContextMessage[] | null | undefined;
+    try {
+      if (needsAuthor) author = await resolveSlackUserName(item.author_id ?? undefined, item.author);
+      if (needsThreadContext) {
+        threadContext = await getThreadContext(item.slack_channel_id, {
+          ts: item.slack_ts,
+          thread_ts: item.thread_ts ?? undefined,
+          user: item.author_id ?? undefined,
+          text: item.text
+        });
+      }
+    } catch {
+      // A feed read should still succeed if Slack is temporarily unavailable.
+    }
+
+    if (author !== undefined || threadContext !== undefined) {
+      updateTriageItemSlackContext(item.id, { author, threadContext });
+    }
+  }
 }
 
 async function conversationsForIngestion(): Promise<{ conversations: SlackConversation[]; source: ConversationListSource; warnings: string[] }> {
@@ -506,6 +553,80 @@ async function conversationReplies(channel: string, threadTs: string, limit: num
     limit: Math.min(Math.max(limit, 1), 20)
   });
   return payload.messages ?? [];
+}
+
+async function getThreadContext(channel: string, message: SlackMessage): Promise<ThreadContextMessage[] | null> {
+  if (!message.ts || !message.thread_ts || message.thread_ts === message.ts) return [];
+
+  try {
+    const earlierMessages: SlackMessage[] = [];
+    let cursor = '';
+    let reachedCurrentMessage = false;
+
+    do {
+      const payload = await slackApi<SlackApiResponse<{ messages: SlackMessage[] }> & { messages: SlackMessage[] }>('conversations.replies', {
+        channel,
+        ts: message.thread_ts,
+        limit: 200,
+        cursor: cursor || undefined
+      });
+      for (const candidate of payload.messages) {
+        if (!candidate.ts) continue;
+        if (compareSlackTimestamps(candidate.ts, message.ts) < 0) earlierMessages.push(candidate);
+        else reachedCurrentMessage = true;
+      }
+      cursor = payload.response_metadata?.next_cursor ?? '';
+    } while (cursor && !reachedCurrentMessage);
+
+    return Promise.all(earlierMessages.map(async (candidate) => ({
+      ts: candidate.ts!,
+      author: await resolveSlackUserName(candidate.user, candidate.username),
+      author_id: candidate.user ?? null,
+      text: candidate.text ?? ''
+    })));
+  } catch {
+    return null;
+  }
+}
+
+async function resolveSlackUserName(userId: string | undefined, fallback: string | undefined): Promise<string> {
+  if (!userId) return fallback ?? 'unknown';
+  const cached = slackUserNameCache.get(userId);
+  if (cached) return cached;
+
+  const existingRequest = slackUserNameRequests.get(userId);
+  if (existingRequest) return existingRequest;
+
+  const request = fetchSlackUserName(userId, fallback);
+  slackUserNameRequests.set(userId, request);
+  try {
+    return await request;
+  } finally {
+    slackUserNameRequests.delete(userId);
+  }
+}
+
+async function fetchSlackUserName(userId: string, fallback: string | undefined): Promise<string> {
+  try {
+    const payload = await slackApi<SlackApiResponse<{ user: SlackUser }> & { user: SlackUser }>('users.info', { user: userId });
+    const name = payload.user.profile?.display_name?.trim()
+      || payload.user.profile?.real_name?.trim()
+      || payload.user.real_name?.trim()
+      || payload.user.name?.trim()
+      || fallback
+      || userId;
+    slackUserNameCache.set(userId, name);
+    return name;
+  } catch {
+    return fallback ?? userId;
+  }
+}
+
+function compareSlackTimestamps(left: string, right: string): number {
+  const leftNumber = Number(left);
+  const rightNumber = Number(right);
+  if (Number.isFinite(leftNumber) && Number.isFinite(rightNumber)) return leftNumber - rightNumber;
+  return left.localeCompare(right);
 }
 
 async function getPermalink(channel: string, messageTs: string): Promise<string | null> {
