@@ -1,3 +1,4 @@
+import './env';
 import { migrate } from './db';
 import { SocketModeListener } from './socket-mode';
 

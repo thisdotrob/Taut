@@ -1,3 +1,4 @@
+import './env';
 import { createApp } from './routes';
 
 const port = Number(process.env.PORT ?? 8787);

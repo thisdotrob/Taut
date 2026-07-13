@@ -1,3 +1,4 @@
+import './env';
 import { migrate, seedDemoData } from './db';
 import { ingestSlack } from './slack';
 
