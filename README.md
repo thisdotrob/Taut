@@ -19,7 +19,7 @@ pnpm dev
 
 Open http://localhost:5173.
 
-The API runs on http://localhost:8787 and Vite proxies `/api/*` to it.
+The API runs on http://localhost:8787 by default and Vite proxies `/api/*` to the same `TAUT_API_PORT`/`PORT`.
 
 ## Slack Socket Mode for near-real-time events
 
