@@ -94,6 +94,11 @@ TAUT_APP_URL=http://localhost:5173
 
 `SLACK_REDIRECT_URI` must exactly match one of the Slack app redirect URLs.
 
+
+## How this relates to Socket Mode
+
+Socket Mode removes the public HTTPS Request URL requirement for ongoing Events API delivery, but it does not replace OAuth. Taut still uses this OAuth user-token flow for Rob-visible Web API access, context/permalinks, and explicit review-first replies/reactions. See `docs/slack-socket-mode.md` for the Socket Mode listener and `SLACK_APP_TOKEN` setup.
+
 ## Dev-only fallback tokens
 
 Only use these when OAuth is not convenient during local development:

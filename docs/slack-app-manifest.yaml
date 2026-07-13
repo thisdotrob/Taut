@@ -4,9 +4,9 @@ display_information:
   background_color: "#17130f"
 oauth_config:
   redirect_urls:
-    # Slack requires HTTPS for OAuth redirects. Replace this placeholder with
-    # your HTTPS tunnel or deployed backend callback URL, and set
-    # SLACK_REDIRECT_URI to exactly the same value.
+    # OAuth still needs HTTPS. Replace this placeholder with your HTTPS tunnel
+    # or deployed backend callback URL, and set SLACK_REDIRECT_URI to exactly
+    # the same value.
     - https://taut.example.com/api/slack/oauth/callback
   scopes:
     user:
@@ -22,6 +22,14 @@ oauth_config:
       - reactions:write
       - users:read
 settings:
+  event_subscriptions:
+    # Socket Mode removes the need for an Events API Request URL.
+    # These workspace/user events are scoped to the authorized user's view.
+    user_events:
+      - message.channels
+      - message.groups
+      - message.im
+      - message.mpim
   org_deploy_enabled: false
-  socket_mode_enabled: false
+  socket_mode_enabled: true
   token_rotation_enabled: false

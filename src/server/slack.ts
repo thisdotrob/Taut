@@ -37,6 +37,8 @@ interface SlackMessage {
   text?: string;
   ts?: string;
   thread_ts?: string;
+  channel?: string;
+  channel_type?: string;
 }
 
 interface SlackAuth {
@@ -53,6 +55,26 @@ interface SlackIngestResult {
   conversationsPulled: number;
   itemsCreated: number;
   skippedByRule: number;
+}
+
+export interface SlackMessageEvent {
+  type?: string;
+  subtype?: string;
+  channel?: string;
+  channel_type?: string;
+  user?: string;
+  username?: string;
+  bot_id?: string;
+  text?: string;
+  ts?: string;
+  thread_ts?: string;
+}
+
+export interface SlackMessageEventIngestResult {
+  created: boolean;
+  skipped: boolean;
+  reason: string;
+  itemId: string | null;
 }
 
 export async function slackApi<T>(method: string, params: Record<string, string | number | boolean | undefined> = {}, httpMethod: 'GET' | 'POST' = 'GET'): Promise<T> {
@@ -158,6 +180,44 @@ export async function ingestSlack(limitPerConversation = 10): Promise<SlackInges
   return { auth, conversationsSeen: conversations.length, conversationsPulled, itemsCreated, skippedByRule };
 }
 
+export async function ingestSlackMessageEvent(message: SlackMessageEvent): Promise<SlackMessageEventIngestResult> {
+  if (message.type !== 'message') return { created: false, skipped: true, reason: 'not_message', itemId: null };
+  if (!message.channel || !message.ts || !message.text) return { created: false, skipped: true, reason: 'missing_required_fields', itemId: null };
+
+  const auth = await getSlackAuth();
+  const kind = eventConversationKind(message.channel_type);
+  const conversation = upsertConversation({
+    slackChannelId: message.channel,
+    name: await eventConversationName(message.channel, message.channel_type, message.user),
+    kind,
+    isMember: true
+  });
+
+  if (conversation.pull_setting === 'disabled') return { created: false, skipped: true, reason: 'pull_disabled', itemId: null };
+  if (!shouldIngestMessage(message, auth.user_id, conversation)) return { created: false, skipped: true, reason: 'filtered_message', itemId: null };
+  if (conversation.pull_setting === 'mentions_only' && !messageMentions(message, auth.user_id) && conversation.kind !== 'im') {
+    return { created: false, skipped: true, reason: 'mentions_only', itemId: null };
+  }
+
+  const permalink = await getPermalink(conversation.slack_channel_id, message.ts);
+  const created = createTriageItem({
+    conversation,
+    slackTs: message.ts,
+    threadTs: message.thread_ts ?? message.ts,
+    author: message.username ?? message.user ?? 'unknown',
+    authorId: message.user ?? null,
+    text: message.text,
+    permalink,
+    isDirect: conversation.kind === 'im' || conversation.kind === 'mpim',
+    mentionsUser: messageMentions(message, auth.user_id)
+  });
+
+  markConversationPulled(conversation.id);
+
+  if (!created) return { created: false, skipped: true, reason: 'duplicate', itemId: null };
+  return { created: true, skipped: false, reason: 'created', itemId: created.id };
+}
+
 async function listSlackConversations(): Promise<SlackConversation[]> {
   const conversations: SlackConversation[] = [];
   let cursor = '';
@@ -197,6 +257,17 @@ async function getPermalink(channel: string, messageTs: string): Promise<string 
   }
 }
 
+async function getConversationInfo(channel: string): Promise<SlackConversation | null> {
+  try {
+    const payload = await slackApi<SlackApiResponse<{ channel: SlackConversation }> & { channel: SlackConversation }>('conversations.info', {
+      channel
+    });
+    return payload.channel;
+  } catch {
+    return null;
+  }
+}
+
 function shouldIngestMessage(message: SlackMessage, currentUserId: string, conversation: ConversationRecord): boolean {
   if (!message.ts || !message.text) return false;
   if (message.subtype && !['thread_broadcast'].includes(message.subtype)) return false;
@@ -221,5 +292,20 @@ function conversationKind(conversation: SlackConversation): string {
   if (conversation.is_im) return 'im';
   if (conversation.is_mpim) return 'mpim';
   if (conversation.is_group || conversation.is_private) return 'private_channel';
+  return 'channel';
+}
+
+async function eventConversationName(channel: string, channelType: string | undefined, user: string | undefined): Promise<string> {
+  const info = await getConversationInfo(channel);
+  if (info) return conversationName(info);
+  if (channelType === 'im' && user) return `DM ${user}`;
+  if (channelType === 'mpim') return `Group DM ${channel}`;
+  return channel;
+}
+
+function eventConversationKind(channelType: string | undefined): string {
+  if (channelType === 'im') return 'im';
+  if (channelType === 'mpim') return 'mpim';
+  if (channelType === 'group') return 'private_channel';
   return 'channel';
 }

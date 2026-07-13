@@ -21,6 +21,22 @@ Open http://localhost:5173.
 
 The API runs on http://localhost:8787 and Vite proxies `/api/*` to it.
 
+## Slack Socket Mode for near-real-time events
+
+Taut supports Slack Socket Mode so ongoing message events do not require a public HTTPS Events API Request URL. Run it with:
+
+```bash
+pnpm socket
+```
+
+Socket Mode still needs an app-level token:
+
+```bash
+SLACK_APP_TOKEN=xapp-... # app-level token with connections:write
+```
+
+Socket Mode is only event delivery. Taut still needs the OAuth user-token flow below for Rob-visible Web API access and review-first writes. Keep polling/backfill via **Pull Slack** or `pnpm ingest` for missed events. See `docs/slack-socket-mode.md`.
+
 ## Slack setup: use OAuth user tokens
 
 Taut's real Slack path is now **OAuth user-token setup**, not the earlier bot-token smoke-test path.
@@ -111,6 +127,7 @@ pnpm build     # type-check and build frontend
 pnpm start     # serve built frontend through the API server
 pnpm seed      # insert demo data
 pnpm ingest    # run one Slack ingestion pass from the CLI
+pnpm socket    # run the Slack Socket Mode listener
 ```
 
 ## Current limitations
