@@ -33,20 +33,23 @@ body {
 
 button,
 select,
-textarea {
+textarea,
+input {
   font: inherit;
 }
 
 button,
 a,
-select {
+select,
+input {
   transition: transform 180ms ease, box-shadow 180ms ease, border-color 180ms ease, background-color 180ms ease;
 }
 
 button:focus-visible,
 a:focus-visible,
 select:focus-visible,
-textarea:focus-visible {
+textarea:focus-visible,
+input:focus-visible {
   outline: 3px solid rgba(240, 109, 58, 0.34);
   outline-offset: 2px;
 }
@@ -270,6 +273,164 @@ h2 {
   color: var(--ink);
   box-shadow: 0 6px 20px rgba(60, 42, 26, 0.1);
 }
+
+
+.source-rules-panel {
+  margin-top: 2px;
+}
+
+.source-rules-heading .muted {
+  max-width: 760px;
+  margin: 8px 0 0;
+  line-height: 1.5;
+}
+
+.source-selected-summary {
+  min-width: 110px;
+  padding: 12px 16px;
+  border-radius: 20px;
+  background: rgba(23, 19, 15, 0.06);
+  text-align: center;
+}
+
+.source-selected-summary strong {
+  display: block;
+  font-size: 2rem;
+  line-height: 1;
+}
+
+.source-selected-summary span {
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-weight: 850;
+  text-transform: uppercase;
+}
+
+.source-controls {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) repeat(2, minmax(180px, 0.45fr));
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+input:not([type='checkbox']) {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.74);
+  color: var(--ink);
+  padding: 10px 12px;
+}
+
+.source-toolbar,
+.source-bulk-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.checkbox-label {
+  display: inline-flex;
+  grid-template-columns: none;
+  align-items: center;
+  gap: 8px;
+  color: var(--ink);
+  font-size: 0.9rem;
+  font-weight: 700;
+}
+
+.checkbox-label input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent-dark);
+}
+
+.source-close-option {
+  flex: 1 1 320px;
+  padding: 10px 12px;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.58);
+}
+
+.source-list {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.42);
+}
+
+.source-row {
+  display: grid;
+  grid-template-columns: minmax(230px, 1.4fr) minmax(90px, 0.5fr) minmax(120px, 0.5fr) minmax(150px, 0.6fr);
+  gap: 12px;
+  align-items: center;
+  padding: 12px 14px;
+  border-top: 1px solid var(--border);
+}
+
+.source-row:first-child {
+  border-top: 0;
+}
+
+.source-row-header {
+  color: var(--muted);
+  font-size: 0.76rem;
+  font-weight: 850;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  background: rgba(23, 19, 15, 0.04);
+}
+
+.source-row:not(.source-row-header) {
+  cursor: pointer;
+  color: var(--ink);
+  font-size: 0.95rem;
+}
+
+.source-row.selected {
+  background: rgba(240, 109, 58, 0.1);
+}
+
+.source-name-cell {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.source-name-cell input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent-dark);
+}
+
+.source-name-cell strong,
+.source-counts strong {
+  color: var(--ink);
+}
+
+.source-name-cell small,
+.source-counts small {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.rule-badge {
+  justify-self: start;
+  padding: 6px 10px;
+  border-radius: 999px;
+  color: white;
+  font-size: 0.78rem;
+  font-weight: 850;
+}
+
+.rule-badge.pull_all { background: #2f855a; }
+.rule-badge.mentions_only { background: #345eaa; }
+.rule-badge.disabled { background: #80756b; }
 
 .slo-table {
   overflow: hidden;
@@ -510,6 +671,14 @@ select {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .source-controls {
+    grid-template-columns: 1fr;
+  }
+
+  .source-row {
+    grid-template-columns: minmax(220px, 1.2fr) repeat(3, minmax(96px, 0.6fr));
+  }
+
   .slo-table {
     overflow-x: auto;
   }
@@ -543,10 +712,22 @@ select {
   }
 
   .hero-actions button,
-  .action-bar button {
+  .action-bar button,
+  .source-toolbar button,
+  .source-bulk-actions button {
     flex: 1 1 100%;
   }
+
+  .source-row {
+    grid-template-columns: 1fr;
+    align-items: start;
+  }
+
+  .source-row-header {
+    display: none;
+  }
 }
+
 
 @media (max-width: 900px) {
   .slo-table {

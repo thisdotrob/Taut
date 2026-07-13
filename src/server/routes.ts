@@ -9,6 +9,7 @@ import {
   getDbPath,
   getItem,
   getLatestDraft,
+  listConversationSources,
   listConversations,
   listItems,
   markItemStatus,
@@ -16,7 +17,8 @@ import {
   recordAction,
   seedDemoData,
   storeLearningDelta,
-  updateConversationPullSetting
+  updateConversationPullSetting,
+  updateConversationPullSettings
 } from './db';
 import type { PullSetting } from './types';
 
@@ -87,7 +89,7 @@ export function createApp(): express.Express {
   });
 
   app.get('/api/conversations', (_req, res) => {
-    res.json(listConversations());
+    res.json(listConversationSources());
   });
 
   app.get('/api/slo', (_req, res) => {
@@ -117,6 +119,20 @@ export function createApp(): express.Express {
       return;
     }
     res.json(updateConversationPullSetting(String(req.params.id), pullSetting));
+  });
+
+  app.patch('/api/conversations/pull-rules', (req, res) => {
+    const conversationIds = Array.isArray(req.body?.conversationIds) ? req.body.conversationIds.map(String) : [];
+    const pullSetting = req.body?.pullSetting as PullSetting | undefined;
+    const closeOpenItems = Boolean(req.body?.closeOpenItems);
+
+    if (!pullSetting || !['pull_all', 'mentions_only', 'disabled'].includes(pullSetting)) {
+      res.status(400).json({ ok: false, error: 'pullSetting must be pull_all, mentions_only, or disabled' });
+      return;
+    }
+
+    const result = updateConversationPullSettings({ conversationIds, pullSetting, closeOpenItems });
+    res.json({ ok: true, result, conversations: listConversationSources(), items: listItems('open'), slo: computeSloSummary() });
   });
 
   app.post('/api/items/:id/actions', asyncHandler(async (req, res) => {

@@ -22,6 +22,14 @@ export interface ConversationRecord {
   updated_at: string;
 }
 
+
+export interface ConversationSourceRecord extends ConversationRecord {
+  open_item_count: number;
+  recent_item_count: number;
+  total_item_count: number;
+  latest_item_at: string | null;
+}
+
 export interface TriageItemRecord {
   id: string;
   conversation_id: string;

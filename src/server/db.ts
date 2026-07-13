@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import type {
   Classification,
   ConversationRecord,
+  ConversationSourceRecord,
   DraftRecord,
   PullSetting,
   SlackConnectionRecord,
@@ -158,12 +159,60 @@ export function listConversations(): ConversationRecord[] {
   return db.prepare('SELECT * FROM conversations ORDER BY kind, name').all() as ConversationRecord[];
 }
 
+export function listConversationSources(): ConversationSourceRecord[] {
+  const recentSince = new Date(Date.now() - 7 * 24 * 60 * 60_000).toISOString();
+  return db.prepare(`
+    SELECT
+      c.*,
+      COALESCE(SUM(CASE WHEN ti.status = 'open' THEN 1 ELSE 0 END), 0) AS open_item_count,
+      COALESCE(SUM(CASE WHEN ti.created_at >= @recentSince THEN 1 ELSE 0 END), 0) AS recent_item_count,
+      COUNT(ti.id) AS total_item_count,
+      MAX(ti.created_at) AS latest_item_at
+    FROM conversations c
+    LEFT JOIN triage_items ti ON ti.conversation_id = c.id
+    GROUP BY c.id
+    ORDER BY
+      CASE c.kind WHEN 'im' THEN 0 WHEN 'mpim' THEN 1 WHEN 'private_channel' THEN 2 ELSE 3 END,
+      c.name COLLATE NOCASE
+  `).all({ recentSince }) as ConversationSourceRecord[];
+}
+
 export function updateConversationPullSetting(conversationId: string, pullSetting: PullSetting): ConversationRecord {
   const now = new Date().toISOString();
   db.prepare('UPDATE conversations SET pull_setting = ?, updated_at = ? WHERE id = ?').run(pullSetting, now, conversationId);
   const updated = db.prepare('SELECT * FROM conversations WHERE id = ?').get(conversationId) as ConversationRecord | undefined;
   if (!updated) throw new Error(`Conversation not found: ${conversationId}`);
   return updated;
+}
+
+export function updateConversationPullSettings(input: {
+  conversationIds: string[];
+  pullSetting: PullSetting;
+  closeOpenItems?: boolean;
+}): { updatedConversations: number; closedOpenItems: number; pullSetting: PullSetting } {
+  const uniqueIds = Array.from(new Set(input.conversationIds.filter(Boolean)));
+  if (uniqueIds.length === 0) throw new Error('Select at least one source.');
+
+  const now = new Date().toISOString();
+  const updateConversation = db.prepare('UPDATE conversations SET pull_setting = ?, updated_at = ? WHERE id = ?');
+  const closeItemsForConversation = db.prepare(
+    "UPDATE triage_items SET status = 'closed' WHERE conversation_id = ? AND status = 'open'"
+  );
+
+  const result = db.transaction(() => {
+    let updatedConversations = 0;
+    let closedOpenItems = 0;
+
+    for (const conversationId of uniqueIds) {
+      updatedConversations += updateConversation.run(input.pullSetting, now, conversationId).changes;
+      if (input.closeOpenItems) closedOpenItems += closeItemsForConversation.run(conversationId).changes;
+    }
+
+    return { updatedConversations, closedOpenItems, pullSetting: input.pullSetting };
+  })();
+
+  if (result.updatedConversations === 0) throw new Error('No matching sources found.');
+  return result;
 }
 
 export function markConversationPulled(conversationId: string): void {

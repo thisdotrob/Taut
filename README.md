@@ -32,6 +32,14 @@ Demo Slack IDs use prefixes such as `CDEMO*`, `DDEMO*`, `GDEMO*`, or `MDEMO*`. T
 pnpm clear-demo
 ```
 
+## Manage sources / batch pull rules
+
+Use **Manage sources** in the main feed to batch-control Taut's own per-conversation pull rules without adding a Slack-like sidebar. The panel supports search, type/activity filters, multi-select, and fast actions for `disabled`, `mentions_only`, and `pull_all`.
+
+When quieting noisy sources, keep **Also close existing open feed items** enabled to safely close current open items from the selected sources. This does not delete triage history, OAuth tokens, or Slack data; it only changes item status in Taut.
+
+DMs and group DMs are labelled separately so they are easy to leave on `pull_all`. Socket Mode and polling both read the same persisted pull rules, so changes apply to new events immediately.
+
 ## Slack Socket Mode for near-real-time events
 
 Taut supports Slack Socket Mode so ongoing message events do not require a public HTTPS Events API Request URL. Run it with:

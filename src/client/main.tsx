@@ -44,6 +44,10 @@ interface Conversation {
   is_member: number;
   pull_setting: PullSetting;
   last_pulled_at: string | null;
+  open_item_count: number;
+  recent_item_count: number;
+  total_item_count: number;
+  latest_item_at: string | null;
 }
 
 interface SloBucket {
@@ -90,6 +94,10 @@ interface SlackConnectionStatus {
   devFallbackAvailable: boolean;
 }
 
+type SourceTypeFilter = 'all' | 'channels' | 'private_channel' | 'dms';
+type SourceActivityFilter = 'all' | 'open' | 'recent';
+type SelectedSourceMap = Record<string, boolean>;
+
 const classificationAccent: Record<Classification, string> = {
   'team unblock / direct-report request': 'critical',
   'direct ask / decision needed': 'decision',
@@ -110,6 +118,12 @@ function App(): React.ReactElement {
   const [pullRetryAt, setPullRetryAt] = useState<string | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [draftEdits, setDraftEdits] = useState<Record<string, string>>({});
+  const [sourcesOpen, setSourcesOpen] = useState(false);
+  const [sourceSearch, setSourceSearch] = useState('');
+  const [sourceTypeFilter, setSourceTypeFilter] = useState<SourceTypeFilter>('all');
+  const [sourceActivityFilter, setSourceActivityFilter] = useState<SourceActivityFilter>('open');
+  const [selectedSourceIds, setSelectedSourceIds] = useState<SelectedSourceMap>({});
+  const [closeOpenOnBatch, setCloseOpenOnBatch] = useState(true);
   const [manualReplies, setManualReplies] = useState<Record<string, string>>({});
 
   useEffect(() => {
@@ -235,11 +249,65 @@ function App(): React.ReactElement {
     await performAction(item, 'change_pull_rule', { pullSetting });
   }
 
+  function selectSources(sourceIds: string[], selected: boolean): void {
+    setSelectedSourceIds((current) => {
+      const next = { ...current };
+      for (const sourceId of sourceIds) {
+        if (selected) next[sourceId] = true;
+        else delete next[sourceId];
+      }
+      return next;
+    });
+  }
+
+  function toggleSource(sourceId: string): void {
+    setSelectedSourceIds((current) => {
+      const next = { ...current };
+      if (next[sourceId]) delete next[sourceId];
+      else next[sourceId] = true;
+      return next;
+    });
+  }
+
+  async function applyBatchPullRule(pullSetting: PullSetting): Promise<void> {
+    const conversationIds = selectedSourceIdsArray;
+    if (conversationIds.length === 0) {
+      setToast({ kind: 'error', message: 'Select at least one source first.' });
+      return;
+    }
+
+    setBusy(`batch:${pullSetting}`);
+    try {
+      const closeOpenItems = closeOpenOnBatch && pullSetting !== 'pull_all';
+      const response = await api<{ result: { updatedConversations: number; closedOpenItems: number; pullSetting: PullSetting } }>('/api/conversations/pull-rules', {
+        method: 'PATCH',
+        body: JSON.stringify({ conversationIds, pullSetting, closeOpenItems })
+      });
+      setSelectedSourceIds({});
+      setToast({
+        kind: 'success',
+        message: `Updated ${response.result.updatedConversations} source${response.result.updatedConversations === 1 ? '' : 's'} to ${ruleLabel(response.result.pullSetting)}${
+          response.result.closedOpenItems > 0 ? ` and closed ${response.result.closedOpenItems} open feed item${response.result.closedOpenItems === 1 ? '' : 's'}` : ''
+        }.`
+      });
+      await refresh();
+    } catch (error) {
+      showError(error);
+    } finally {
+      setBusy(null);
+    }
+  }
+
   function showError(error: unknown): void {
     setToast({ kind: 'error', message: error instanceof Error ? error.message : 'Something went wrong.' });
   }
 
   const openItems = useMemo(() => items.filter((item) => item.status === 'open'), [items]);
+  const filteredSources = useMemo(
+    () => conversations.filter((source) => sourceMatchesSearch(source, sourceSearch) && sourceMatchesType(source, sourceTypeFilter) && sourceMatchesActivity(source, sourceActivityFilter)),
+    [conversations, sourceActivityFilter, sourceSearch, sourceTypeFilter]
+  );
+  const selectedSourceIdsArray = useMemo(() => Object.keys(selectedSourceIds).filter((sourceId) => selectedSourceIds[sourceId]), [selectedSourceIds]);
   const pullRetrySeconds = pullRetryAt ? Math.max(0, Math.ceil((new Date(pullRetryAt).getTime() - nowMs) / 1_000)) : 0;
   const pullSlackDisabled = busy === 'ingest' || slackConnection?.connected === false || pullRetrySeconds > 0;
 
@@ -256,6 +324,9 @@ function App(): React.ReactElement {
         <div className="hero-actions" aria-label="Data controls">
           <button type="button" className="primary" onClick={() => void ingestSlack()} disabled={pullSlackDisabled}>
             {busy === 'ingest' ? 'Pulling Slack…' : pullRetrySeconds > 0 ? `Retry in ${pullRetrySeconds}s` : 'Pull Slack'}
+          </button>
+          <button type="button" className="secondary" onClick={() => setSourcesOpen((open) => !open)}>
+            {sourcesOpen ? 'Hide sources' : 'Manage sources'}
           </button>
           <button type="button" className="secondary" onClick={() => void seedDemo()} disabled={busy === 'seed'}>
             {busy === 'seed' ? 'Seeding…' : 'Seed demo'}
@@ -312,6 +383,28 @@ function App(): React.ReactElement {
         <MetricCard label="Within SLO" value={`${slo?.repliedWithinSloPercent ?? 0}%`} hint="Sent replies inside due time" />
         <MetricCard label="Sources" value={String(conversations.length)} hint="Channels, DMs, group DMs" />
       </section>
+
+      {sourcesOpen ? (
+        <SourceRulesPanel
+          conversations={conversations}
+          filteredSources={filteredSources}
+          selectedSourceIds={selectedSourceIds}
+          selectedCount={selectedSourceIdsArray.length}
+          sourceSearch={sourceSearch}
+          sourceTypeFilter={sourceTypeFilter}
+          sourceActivityFilter={sourceActivityFilter}
+          closeOpenOnBatch={closeOpenOnBatch}
+          busy={busy}
+          onSearchChange={setSourceSearch}
+          onTypeFilterChange={setSourceTypeFilter}
+          onActivityFilterChange={setSourceActivityFilter}
+          onCloseOpenChange={setCloseOpenOnBatch}
+          onToggleSource={toggleSource}
+          onSelectSources={selectSources}
+          onClearSelection={() => setSelectedSourceIds({})}
+          onApplyRule={(pullSetting) => void applyBatchPullRule(pullSetting)}
+        />
+      ) : null}
 
       <section className="panel slo-panel" aria-labelledby="slo-heading">
         <div className="panel-heading">
@@ -482,6 +575,136 @@ function MetricCard(props: { label: string; value: string; hint: string; tone?: 
   );
 }
 
+interface SourceRulesPanelProps {
+  conversations: Conversation[];
+  filteredSources: Conversation[];
+  selectedSourceIds: SelectedSourceMap;
+  selectedCount: number;
+  sourceSearch: string;
+  sourceTypeFilter: SourceTypeFilter;
+  sourceActivityFilter: SourceActivityFilter;
+  closeOpenOnBatch: boolean;
+  busy: string | null;
+  onSearchChange: (value: string) => void;
+  onTypeFilterChange: (value: SourceTypeFilter) => void;
+  onActivityFilterChange: (value: SourceActivityFilter) => void;
+  onCloseOpenChange: (value: boolean) => void;
+  onToggleSource: (sourceId: string) => void;
+  onSelectSources: (sourceIds: string[], selected: boolean) => void;
+  onClearSelection: () => void;
+  onApplyRule: (pullSetting: PullSetting) => void;
+}
+
+function SourceRulesPanel(props: SourceRulesPanelProps): React.ReactElement {
+  const visibleIds = props.filteredSources.map((source) => source.id);
+  const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((sourceId) => props.selectedSourceIds[sourceId]);
+  const contributingChannelIds = props.conversations
+    .filter((source) => !isDirectSource(source.kind) && (source.open_item_count > 0 || source.recent_item_count > 0))
+    .map((source) => source.id);
+  const batchBusy = props.busy?.startsWith('batch:') ?? false;
+  const batchDisabled = props.selectedCount === 0 || props.busy !== null;
+
+  return (
+    <section className="panel source-rules-panel" aria-labelledby="source-rules-heading">
+      <div className="panel-heading source-rules-heading">
+        <div>
+          <p className="eyebrow">Batch rules</p>
+          <h2 id="source-rules-heading">Manage sources</h2>
+          <p className="muted">
+            Quiet noisy channels without a Slack-style sidebar. DMs and group DMs are labelled separately so they are easy to leave on <strong>pull_all</strong>.
+          </p>
+        </div>
+        <div className="source-selected-summary" aria-live="polite">
+          <strong>{props.selectedCount}</strong>
+          <span>selected</span>
+        </div>
+      </div>
+
+      <div className="source-controls" aria-label="Source filters">
+        <label>
+          Search sources
+          <input value={props.sourceSearch} onChange={(event) => props.onSearchChange(event.target.value)} placeholder="Search name or Slack ID" />
+        </label>
+        <label>
+          Type
+          <select value={props.sourceTypeFilter} onChange={(event) => props.onTypeFilterChange(event.target.value as SourceTypeFilter)}>
+            <option value="all">All types</option>
+            <option value="channels">Channels</option>
+            <option value="private_channel">Private channels</option>
+            <option value="dms">DMs + group DMs</option>
+          </select>
+        </label>
+        <label>
+          Activity
+          <select value={props.sourceActivityFilter} onChange={(event) => props.onActivityFilterChange(event.target.value as SourceActivityFilter)}>
+            <option value="all">All sources</option>
+            <option value="open">Contributing open items</option>
+            <option value="recent">Recent items</option>
+          </select>
+        </label>
+      </div>
+
+      <div className="source-toolbar">
+        <button type="button" className="ghost" onClick={() => props.onSelectSources(visibleIds, !allVisibleSelected)} disabled={visibleIds.length === 0}>
+          {allVisibleSelected ? 'Unselect visible' : 'Select visible'}
+        </button>
+        <button type="button" className="ghost" onClick={() => props.onSelectSources(contributingChannelIds, true)} disabled={contributingChannelIds.length === 0}>
+          Select contributing channels
+        </button>
+        <button type="button" className="ghost" onClick={props.onClearSelection} disabled={props.selectedCount === 0}>
+          Clear selection
+        </button>
+      </div>
+
+      <div className="source-bulk-actions" aria-label="Bulk apply pull rules">
+        <button type="button" className="danger" onClick={() => props.onApplyRule('disabled')} disabled={batchDisabled}>
+          {batchBusy ? 'Updating…' : 'Disable selected'}
+        </button>
+        <button type="button" className="secondary" onClick={() => props.onApplyRule('mentions_only')} disabled={batchDisabled}>
+          Mentions only for selected
+        </button>
+        <button type="button" className="primary" onClick={() => props.onApplyRule('pull_all')} disabled={batchDisabled}>
+          Pull all for selected
+        </button>
+        <label className="checkbox-label source-close-option">
+          <input type="checkbox" checked={props.closeOpenOnBatch} onChange={(event) => props.onCloseOpenChange(event.target.checked)} />
+          Also close existing open feed items when setting selected sources to disabled or mentions-only.
+        </label>
+      </div>
+
+      <div className="source-list" role="table" aria-label="Conversation sources">
+        <div className="source-row source-row-header" role="row">
+          <span>Source</span>
+          <span>Type</span>
+          <span>Rule</span>
+          <span>Open / recent</span>
+        </div>
+        {props.filteredSources.map((source) => {
+          const selected = Boolean(props.selectedSourceIds[source.id]);
+          return (
+            <label className={`source-row ${selected ? 'selected' : ''}`} role="row" key={source.id}>
+              <span className="source-name-cell">
+                <input type="checkbox" checked={selected} onChange={() => props.onToggleSource(source.id)} aria-label={`Select ${source.name}`} />
+                <span>
+                  <strong>{source.name}</strong>
+                  <small>{source.slack_channel_id}</small>
+                </span>
+              </span>
+              <span>{kindLabel(source.kind)}</span>
+              <span className={`rule-badge ${source.pull_setting}`}>{ruleLabel(source.pull_setting)}</span>
+              <span className="source-counts">
+                <strong>{source.open_item_count}</strong> open · <strong>{source.recent_item_count}</strong> recent
+                {source.latest_item_at ? <small>Latest {formatShortDate(source.latest_item_at)}</small> : null}
+              </span>
+            </label>
+          );
+        })}
+        {props.filteredSources.length === 0 ? <p className="empty-inline">No sources match these filters.</p> : null}
+      </div>
+    </section>
+  );
+}
+
 class ApiError extends Error {
   readonly status: number;
   readonly code?: string;
@@ -506,6 +729,39 @@ async function api<T>(url: string, init?: RequestInit): Promise<T> {
   const payload = (await response.json()) as T & ApiErrorPayload;
   if (!response.ok || payload.ok === false) throw new ApiError(payload.error ?? `Request failed: ${response.status}`, response.status, payload);
   return payload;
+}
+
+function sourceMatchesSearch(source: Conversation, search: string): boolean {
+  const query = search.trim().toLowerCase();
+  if (!query) return true;
+  return `${source.name} ${source.slack_channel_id}`.toLowerCase().includes(query);
+}
+
+function sourceMatchesType(source: Conversation, filter: SourceTypeFilter): boolean {
+  if (filter === 'all') return true;
+  if (filter === 'channels') return source.kind === 'channel';
+  if (filter === 'private_channel') return source.kind === 'private_channel';
+  return isDirectSource(source.kind);
+}
+
+function sourceMatchesActivity(source: Conversation, filter: SourceActivityFilter): boolean {
+  if (filter === 'all') return true;
+  if (filter === 'open') return source.open_item_count > 0;
+  return source.recent_item_count > 0;
+}
+
+function isDirectSource(kind: string): boolean {
+  return kind === 'im' || kind === 'mpim';
+}
+
+function ruleLabel(rule: PullSetting): string {
+  if (rule === 'pull_all') return 'pull_all';
+  if (rule === 'mentions_only') return 'mentions_only';
+  return 'disabled';
+}
+
+function formatShortDate(value: string): string {
+  return new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' }).format(new Date(value));
 }
 
 function isDemoSlackId(slackChannelId: string): boolean {
