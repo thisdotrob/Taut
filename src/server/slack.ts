@@ -1,6 +1,7 @@
 import { ProxyAgent, setGlobalDispatcher } from 'undici';
 import type { ConversationRecord } from './types';
 import { createTriageItem, markConversationPulled, upsertConversation } from './db';
+import { resolveSlackToken } from './slack-oauth';
 
 const proxyUrl = process.env.HTTPS_PROXY ?? process.env.HTTP_PROXY;
 if (proxyUrl) {
@@ -43,6 +44,7 @@ interface SlackAuth {
   user: string;
   team: string;
   url: string;
+  token_source: string;
 }
 
 interface SlackIngestResult {
@@ -56,6 +58,7 @@ interface SlackIngestResult {
 export async function slackApi<T>(method: string, params: Record<string, string | number | boolean | undefined> = {}, httpMethod: 'GET' | 'POST' = 'GET'): Promise<T> {
   const url = new URL(`https://slack.com/api/${method}`);
   const bodyParams = new URLSearchParams();
+  const resolvedToken = resolveSlackToken();
 
   for (const [key, value] of Object.entries(params)) {
     if (value === undefined) continue;
@@ -63,8 +66,9 @@ export async function slackApi<T>(method: string, params: Record<string, string 
     else bodyParams.set(key, String(value));
   }
 
-  const headers: Record<string, string> = {};
-  if (process.env.SLACK_BOT_TOKEN) headers.Authorization = `Bearer ${process.env.SLACK_BOT_TOKEN}`;
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${resolvedToken.token}`
+  };
   if (httpMethod === 'POST') headers['Content-Type'] = 'application/x-www-form-urlencoded';
 
   const response = await fetch(url, {
@@ -83,8 +87,9 @@ export async function slackApi<T>(method: string, params: Record<string, string 
 }
 
 export async function getSlackAuth(): Promise<SlackAuth> {
+  const resolvedToken = resolveSlackToken();
   const payload = await slackApi<SlackApiResponse<SlackAuth> & SlackAuth>('auth.test');
-  return { user_id: payload.user_id, user: payload.user, team: payload.team, url: payload.url };
+  return { user_id: payload.user_id, user: payload.user, team: payload.team, url: payload.url, token_source: resolvedToken.source };
 }
 
 export async function postSlackReply(input: { channel: string; threadTs: string | null; text: string }): Promise<{ ts: string }> {

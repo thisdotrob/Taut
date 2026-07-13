@@ -2,7 +2,16 @@ import Database from 'better-sqlite3';
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import type { Classification, ConversationRecord, DraftRecord, PullSetting, SloSummary, TriageItemRecord, TriageItemWithContext } from './types';
+import type {
+  Classification,
+  ConversationRecord,
+  DraftRecord,
+  PullSetting,
+  SlackConnectionRecord,
+  SloSummary,
+  TriageItemRecord,
+  TriageItemWithContext
+} from './types';
 import { buildDraft, classifyMessage, compareManualReply, makeExcerpt, sloMinutesFor } from './triage';
 
 const dbPath = process.env.TAUT_DB_PATH ?? path.resolve(process.cwd(), 'data', 'taut.db');
@@ -73,9 +82,30 @@ export function migrate(): void {
       created_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS slack_oauth_states (
+      state TEXT PRIMARY KEY,
+      redirect_after TEXT,
+      expires_at TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS slack_connections (
+      id TEXT PRIMARY KEY,
+      team_id TEXT NOT NULL,
+      team_name TEXT NOT NULL,
+      authed_user_id TEXT NOT NULL,
+      authed_user_name TEXT,
+      access_token TEXT NOT NULL,
+      scope TEXT NOT NULL,
+      token_type TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_triage_items_status_due ON triage_items(status, due_at);
     CREATE INDEX IF NOT EXISTS idx_triage_items_classification ON triage_items(classification);
     CREATE INDEX IF NOT EXISTS idx_actions_item ON item_actions(triage_item_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_slack_oauth_states_expires ON slack_oauth_states(expires_at);
   `);
 }
 
@@ -135,6 +165,60 @@ export function updateConversationPullSetting(conversationId: string, pullSettin
 export function markConversationPulled(conversationId: string): void {
   const now = new Date().toISOString();
   db.prepare('UPDATE conversations SET last_pulled_at = ?, updated_at = ? WHERE id = ?').run(now, now, conversationId);
+}
+
+export function createSlackOAuthState(redirectAfter: string | null): string {
+  const state = randomUUID();
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + 10 * 60_000).toISOString();
+  db.prepare('DELETE FROM slack_oauth_states WHERE expires_at < ?').run(now.toISOString());
+  db.prepare('INSERT INTO slack_oauth_states (state, redirect_after, expires_at, created_at) VALUES (?, ?, ?, ?)').run(
+    state,
+    redirectAfter,
+    expiresAt,
+    now.toISOString()
+  );
+  return state;
+}
+
+export function consumeSlackOAuthState(state: string): { redirectAfter: string | null } | null {
+  const row = db.prepare('SELECT state, redirect_after, expires_at FROM slack_oauth_states WHERE state = ?').get(state) as
+    | { state: string; redirect_after: string | null; expires_at: string }
+    | undefined;
+  db.prepare('DELETE FROM slack_oauth_states WHERE state = ? OR expires_at < ?').run(state, new Date().toISOString());
+
+  if (!row) return null;
+  if (row.expires_at < new Date().toISOString()) return null;
+  return { redirectAfter: row.redirect_after };
+}
+
+export function storeSlackConnection(input: {
+  teamId: string;
+  teamName: string;
+  authedUserId: string;
+  authedUserName: string | null;
+  accessToken: string;
+  scope: string;
+  tokenType: string;
+}): SlackConnectionRecord {
+  const now = new Date().toISOString();
+  db.prepare('DELETE FROM slack_connections').run();
+  const id = randomUUID();
+  db.prepare(`
+    INSERT INTO slack_connections (
+      id, team_id, team_name, authed_user_id, authed_user_name, access_token, scope, token_type, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(id, input.teamId, input.teamName, input.authedUserId, input.authedUserName, input.accessToken, input.scope, input.tokenType, now, now);
+
+  return getSlackConnection()!;
+}
+
+export function getSlackConnection(): SlackConnectionRecord | null {
+  return (db.prepare('SELECT * FROM slack_connections ORDER BY updated_at DESC LIMIT 1').get() as SlackConnectionRecord | undefined) ?? null;
+}
+
+export function clearSlackConnection(): void {
+  db.prepare('DELETE FROM slack_connections').run();
 }
 
 export function createTriageItem(input: {

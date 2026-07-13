@@ -76,3 +76,31 @@ export interface SloSummary {
   agingQueue: TriageItemWithContext[];
   repliedWithinSloPercent: number;
 }
+
+export type SlackTokenSource = 'oauth_user' | 'env_user' | 'env_bot';
+
+export interface SlackConnectionRecord {
+  id: string;
+  team_id: string;
+  team_name: string;
+  authed_user_id: string;
+  authed_user_name: string | null;
+  access_token: string;
+  scope: string;
+  token_type: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SlackConnectionStatus {
+  connected: boolean;
+  configured: boolean;
+  tokenSource: SlackTokenSource | null;
+  teamId: string | null;
+  teamName: string | null;
+  userId: string | null;
+  userName: string | null;
+  scopes: string[];
+  connectUrl: string;
+  devFallbackAvailable: boolean;
+}

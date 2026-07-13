@@ -7,7 +7,7 @@ Taut is a lightweight AI triage feed for Slack. It intentionally avoids cloning 
 - React + Vite + TypeScript for the UI
 - Express + TypeScript for the local API
 - SQLite via `better-sqlite3` for persistence
-- Slack Web API ingestion/actions, using either `SLACK_BOT_TOKEN` or OneCLI-managed proxy credentials
+- Slack Web API ingestion/actions via Slack OAuth **user tokens** by default
 
 ## Run locally
 
@@ -21,26 +21,45 @@ Open http://localhost:5173.
 
 The API runs on http://localhost:8787 and Vite proxies `/api/*` to it.
 
-## Slack credentials
+## Slack setup: use OAuth user tokens
 
-Taut is review-first and never posts without an explicit UI action.
+Taut's real Slack path is now **OAuth user-token setup**, not the earlier bot-token smoke-test path.
 
-For Slack API access, use one of:
+Why this matters: Rob wants Taut to ingest conversations visible to Rob — public/private channels Rob belongs to, DMs, and group DMs. A bot token only sees conversations the bot is allowed to see, which is usually the wrong scope for Taut.
 
-1. `SLACK_BOT_TOKEN=xoxb-... pnpm dev`, or
-2. run in an environment with OneCLI gateway credentials and `HTTPS_PROXY` configured.
+Use:
 
-The current prototype uses these Slack scopes when available:
+- `docs/slack-app-manifest.yaml` to create/configure the Slack app
+- `docs/slack-oauth-setup.md` for exact setup steps and redirect URL guidance
 
-- `channels:read`, `groups:read`, `im:read`, `mpim:read`
-- `channels:history`, `groups:history`, `im:history`, `mpim:history`
-- `chat:write`, `reactions:write`
+Required app env values:
+
+```bash
+SLACK_CLIENT_ID=...
+SLACK_CLIENT_SECRET=...
+SLACK_REDIRECT_URI=https://taut.example.com/api/slack/oauth/callback
+TAUT_APP_URL=http://localhost:5173
+```
+
+Then run Taut and click **Connect Slack** in the UI. The resulting user token is stored in local SQLite on the server side and is never exposed to the client.
+
+### Dev-only token fallbacks
+
+These are escape hatches only:
+
+```bash
+SLACK_USER_TOKEN=xoxp-... # local user-token shortcut, bypasses OAuth UI
+SLACK_BOT_TOKEN=xoxb-...  # limited smoke test; not Rob's real setup
+```
+
+Do not use `SLACK_BOT_TOKEN` as the main path. It can miss private channels, DMs, group DMs, and any public channel where the bot is not present.
 
 ## Implemented MVP functionality
 
 ### Slack ingestion
 
-- Pulls public channels, private channels, DMs, and group DMs where the user is a member.
+- Pulls public channels, private channels, DMs, and group DMs where the authorized user is a member.
+- Uses stored Slack OAuth user token by default; env-token fallback only for development.
 - Does not rely on starred channels.
 - Persists a per-conversation pull setting:
   - `pull_all`
@@ -51,6 +70,7 @@ The current prototype uses these Slack scopes when available:
 ### UI
 
 - Single triage feed, no Slack-style sidebar and no channel browser.
+- Slack connection panel that clearly shows OAuth user-token vs dev fallback token use.
 - Each item shows source, author, excerpt, classification, SLO/due time, AI suggested action/reply, and Slack permalink.
 - SLO view shows performance by classification, overdue items, aging queue inputs, and replied-within-SLO percentage.
 
@@ -72,6 +92,7 @@ Each feed item supports:
 
 SQLite persists:
 
+- Slack OAuth user-token connection metadata and server-side access token
 - conversations and pull rules
 - triage items
 - classifications and SLO status
@@ -97,4 +118,4 @@ pnpm ingest    # run one Slack ingestion pass from the CLI
 - AI classification and drafts are heuristic placeholders (`heuristic-v0`) ready to be swapped for a model call.
 - Conversation names for DMs use Slack IDs unless user-profile hydration is added.
 - Ingestion currently pulls the latest N messages per conversation rather than an incremental cursor window.
-- Repo creation under `thisdotrob/taut` requires GitHub credentials with access to Rob's personal account.
+- Local SQLite token storage is appropriate for this prototype; production should encrypt tokens and add account/session boundaries.

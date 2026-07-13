@@ -2,6 +2,7 @@ import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { addSlackReaction, getSlackAuth, ingestSlack, postSlackReply } from './slack';
+import { buildSlackOAuthStartUrl, completeSlackOAuth, disconnectSlack, getSlackConnectionStatus, tautAppUrl } from './slack-oauth';
 import {
   computeSloSummary,
   getDbPath,
@@ -24,6 +25,7 @@ export function createApp(): express.Express {
   migrate();
 
   const app = express();
+  app.set('trust proxy', true);
   app.use(express.json({ limit: '1mb' }));
 
   app.get('/api/health', (_req, res) => {
@@ -33,6 +35,50 @@ export function createApp(): express.Express {
   app.get('/api/slack/auth', asyncHandler(async (_req, res) => {
     res.json(await getSlackAuth());
   }));
+
+  app.get('/api/slack/connection', (req, res) => {
+    res.json(getSlackConnectionStatus(req));
+  });
+
+  app.get('/api/slack/oauth/start', (req, res, next) => {
+    try {
+      res.redirect(buildSlackOAuthStartUrl(req));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get('/api/slack/oauth/callback', asyncHandler(async (req, res) => {
+    const result = await completeSlackOAuth(req);
+    const redirectPath = result.redirectAfter ?? '/';
+    const appUrl = `${tautAppUrl()}${redirectPath}`;
+    res.type('html').send(`<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Taut Slack connected</title>
+    <style>
+      body { font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; min-height: 100vh; display: grid; place-items: center; background: #f4f0e8; color: #17130f; }
+      main { max-width: 640px; margin: 24px; padding: 32px; border-radius: 28px; background: #fffaf1; box-shadow: 0 24px 80px rgba(60, 42, 26, 0.14); }
+      a { color: #ad3f1a; font-weight: 800; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Slack connected</h1>
+      <p>Taut connected to ${escapeHtml(result.teamName)} with a Slack user token for user ${escapeHtml(result.userId)}.</p>
+      <p>Granted scopes: ${escapeHtml(result.scopes.join(', ') || 'none reported')}.</p>
+      <p><a href="${escapeHtml(appUrl)}">Return to Taut</a></p>
+    </main>
+  </body>
+</html>`);
+  }));
+
+  app.post('/api/slack/disconnect', (_req, res) => {
+    disconnectSlack();
+    res.json({ ok: true });
+  });
 
   app.get('/api/items', (req, res) => {
     const status = typeof req.query.status === 'string' ? req.query.status : 'open';
@@ -153,4 +199,13 @@ function asyncHandler(handler: (req: express.Request, res: express.Response) => 
 function requireText(value: unknown, message: string): string {
   if (typeof value !== 'string' || value.trim().length === 0) throw new Error(message);
   return value.trim();
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
 }

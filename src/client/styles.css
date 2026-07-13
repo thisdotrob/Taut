@@ -577,3 +577,58 @@ select {
     font-size: 0.62rem;
   }
 }
+
+.slack-connect-panel {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 18px;
+}
+
+.connection-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 14px;
+  color: var(--muted);
+}
+
+.connection-status strong {
+  color: var(--ink);
+}
+
+.status-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 999px;
+  background: #b42318;
+  box-shadow: 0 0 0 4px rgba(180, 35, 24, 0.12);
+}
+
+.status-dot.connected {
+  background: #2f855a;
+  box-shadow: 0 0 0 4px rgba(47, 133, 90, 0.14);
+}
+
+.setup-warning {
+  grid-column: 1 / -1;
+  margin: 0;
+  padding: 12px 14px;
+  border: 1px solid rgba(173, 63, 26, 0.18);
+  border-radius: 16px;
+  background: rgba(240, 109, 58, 0.08);
+  color: var(--accent-dark);
+}
+
+code {
+  padding: 0.08rem 0.28rem;
+  border-radius: 0.4rem;
+  background: rgba(23, 19, 15, 0.08);
+}
+
+@media (max-width: 900px) {
+  .slack-connect-panel {
+    grid-template-columns: 1fr;
+  }
+}

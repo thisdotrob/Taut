@@ -69,6 +69,19 @@ interface ToastState {
   message: string;
 }
 
+interface SlackConnectionStatus {
+  connected: boolean;
+  configured: boolean;
+  tokenSource: 'oauth_user' | 'env_user' | 'env_bot' | null;
+  teamId: string | null;
+  teamName: string | null;
+  userId: string | null;
+  userName: string | null;
+  scopes: string[];
+  connectUrl: string;
+  devFallbackAvailable: boolean;
+}
+
 const classificationAccent: Record<Classification, string> = {
   'team unblock / direct-report request': 'critical',
   'direct ask / decision needed': 'decision',
@@ -81,6 +94,7 @@ function App(): React.ReactElement {
   const [items, setItems] = useState<TriageItem[]>([]);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [slo, setSlo] = useState<SloSummary | null>(null);
+  const [slackConnection, setSlackConnection] = useState<SlackConnectionStatus | null>(null);
   const [statusFilter, setStatusFilter] = useState<'open' | 'all'>('open');
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
@@ -95,14 +109,16 @@ function App(): React.ReactElement {
   async function refresh(): Promise<void> {
     setLoading(true);
     try {
-      const [itemsResponse, conversationsResponse, sloResponse] = await Promise.all([
+      const [itemsResponse, conversationsResponse, sloResponse, slackConnectionResponse] = await Promise.all([
         api<TriageItem[]>(`/api/items?status=${statusFilter}`),
         api<Conversation[]>('/api/conversations'),
-        api<SloSummary>('/api/slo')
+        api<SloSummary>('/api/slo'),
+        api<SlackConnectionStatus>('/api/slack/connection')
       ]);
       setItems(itemsResponse);
       setConversations(conversationsResponse);
       setSlo(sloResponse);
+      setSlackConnection(slackConnectionResponse);
     } catch (error) {
       showError(error);
     } finally {
@@ -134,6 +150,24 @@ function App(): React.ReactElement {
         kind: 'success',
         message: `Pulled ${result.result.conversationsSeen} Slack conversations and created ${result.result.itemsCreated} triage items.`
       });
+      await refresh();
+    } catch (error) {
+      showError(error);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  function connectSlack(): void {
+    const startUrl = slackConnection?.connectUrl ?? '/api/slack/oauth/start';
+    window.location.href = `${startUrl}?redirect=/`;
+  }
+
+  async function disconnectSlack(): Promise<void> {
+    setBusy('disconnect');
+    try {
+      await api('/api/slack/disconnect', { method: 'POST' });
+      setToast({ kind: 'success', message: 'Disconnected the stored Slack OAuth user token.' });
       await refresh();
     } catch (error) {
       showError(error);
@@ -180,7 +214,7 @@ function App(): React.ReactElement {
           </p>
         </div>
         <div className="hero-actions" aria-label="Data controls">
-          <button type="button" className="primary" onClick={() => void ingestSlack()} disabled={busy === 'ingest'}>
+          <button type="button" className="primary" onClick={() => void ingestSlack()} disabled={busy === 'ingest' || slackConnection?.connected === false}>
             {busy === 'ingest' ? 'Pulling Slack…' : 'Pull Slack'}
           </button>
           <button type="button" className="secondary" onClick={() => void seedDemo()} disabled={busy === 'seed'}>
@@ -200,6 +234,34 @@ function App(): React.ReactElement {
           </button>
         </section>
       ) : null}
+
+      <section className="panel slack-connect-panel" aria-labelledby="slack-connect-heading">
+        <div>
+          <p className="eyebrow">Slack connection</p>
+          <h2 id="slack-connect-heading">OAuth user token is the primary path</h2>
+          <p className="muted">
+            Taut uses Slack OAuth user tokens so ingestion sees Rob’s public/private channels, DMs, and group DMs. Env tokens are only a dev escape hatch.
+          </p>
+          <div className="connection-status">
+            <span className={`status-dot ${slackConnection?.connected ? 'connected' : ''}`} aria-hidden="true" />
+            <strong>{connectionLabel(slackConnection)}</strong>
+            <span>{connectionDetail(slackConnection)}</span>
+          </div>
+        </div>
+        <div className="hero-actions">
+          <button type="button" className="primary" onClick={connectSlack} disabled={!slackConnection?.configured}>
+            Connect Slack
+          </button>
+          <button type="button" className="ghost" onClick={() => void disconnectSlack()} disabled={!slackConnection || slackConnection.tokenSource !== 'oauth_user' || busy === 'disconnect'}>
+            Disconnect OAuth token
+          </button>
+        </div>
+        {!slackConnection?.configured ? (
+          <p className="setup-warning">
+            Set <code>SLACK_CLIENT_ID</code> and <code>SLACK_CLIENT_SECRET</code>, then add the redirect URL from <code>docs/slack-oauth-setup.md</code> to the Slack app.
+          </p>
+        ) : null}
+      </section>
 
       <section className="metrics-grid" aria-label="Triage summary">
         <MetricCard label="Open items" value={String(openItems.length)} hint="Visible attention queue" />
@@ -392,6 +454,25 @@ function kindLabel(kind: string): string {
   if (kind === 'mpim') return 'Group DM';
   if (kind === 'private_channel') return 'Private';
   return 'Channel';
+}
+
+function connectionLabel(connection: SlackConnectionStatus | null): string {
+  if (!connection) return 'Checking Slack connection…';
+  if (connection.tokenSource === 'oauth_user') return 'Connected with Slack OAuth user token';
+  if (connection.tokenSource === 'env_user') return 'Using dev fallback SLACK_USER_TOKEN';
+  if (connection.tokenSource === 'env_bot') return 'Using dev fallback SLACK_BOT_TOKEN';
+  return 'Slack not connected';
+}
+
+function connectionDetail(connection: SlackConnectionStatus | null): string {
+  if (!connection) return 'Loading connection status.';
+  if (connection.tokenSource === 'oauth_user') {
+    return `${connection.teamName ?? connection.teamId ?? 'Slack workspace'} · user ${connection.userName ?? connection.userId ?? 'unknown'}`;
+  }
+  if (connection.tokenSource === 'env_user') return 'OAuth setup is bypassed for local development only.';
+  if (connection.tokenSource === 'env_bot') return 'Bot tokens only see conversations the bot can access; do not use this for Rob’s real setup.';
+  if (!connection.configured) return 'OAuth client credentials are missing.';
+  return 'Use Connect Slack to authorize Rob’s Slack account.';
 }
 
 function initials(author: string): string {
