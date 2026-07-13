@@ -8,6 +8,7 @@ Taut is a lightweight AI triage feed for Slack. It intentionally avoids cloning 
 - Express + TypeScript for the local API
 - SQLite via `better-sqlite3` for persistence
 - Slack Web API ingestion/actions via Slack OAuth **user tokens** by default
+- Optional OpenAI Responses API triage/drafting with audited heuristic fallback
 
 ## Run locally
 
@@ -15,12 +16,14 @@ Taut is a lightweight AI triage feed for Slack. It intentionally avoids cloning 
 pnpm install
 pnpm seed      # optional: seed demo triage items
 pnpm clear-demo # remove only seeded demo items/conversations
-pnpm dev
+pnpm dev        # API + web
+# or, after SLACK_APP_TOKEN is configured:
+pnpm dev:all    # API + web + Socket Mode listener
 ```
 
 Open http://localhost:5173.
 
-The API runs on http://localhost:8787 by default and Vite proxies `/api/*` to the same `TAUT_API_PORT`/`PORT`.
+The API runs on http://localhost:8787 by default and Vite proxies `/api/*` to the same `TAUT_API_PORT`/`PORT`. The UI health panel shows API, Slack OAuth, Socket Mode, LLM, and Slack rate-limit state.
 
 ## Demo data
 
@@ -78,6 +81,22 @@ TAUT_APP_URL=http://localhost:5173
 
 Then run Taut and click **Connect Slack** in the UI. The resulting user token is stored in local SQLite on the server side and is never exposed to the client.
 
+## Optional real LLM triage/drafting
+
+Taut now calls a real LLM when configured, and falls back to `heuristic-v0` when no LLM credentials are present or a model call fails.
+
+```bash
+OPENAI_API_KEY=...
+TAUT_LLM_PROVIDER=openai
+TAUT_LLM_MODEL=gpt-5.6
+TAUT_LLM_MAX_OUTPUT_TOKENS=900
+```
+
+The LLM path uses the OpenAI Responses API with structured JSON output. Each triage item stores the model, prompt version, classification rationale, action summary, draft text, and a bounded Slack context snapshot for auditability. Rob's explicit actions — accepted AI drafts, edited sends, manual reply/observe, closes, discards, and learning deltas — are fed into future prompts as recent learning signals.
+
+No OpenAI secret is committed or returned to the browser. Leave `OPENAI_API_KEY` unset to keep local heuristic-only behavior.
+
+
 ### Dev-only token fallbacks
 
 These are escape hatches only:
@@ -96,6 +115,8 @@ Do not use `SLACK_BOT_TOKEN` as the main path. It can miss private channels, DMs
 - Pulls public channels, private channels, DMs, and group DMs where the authorized user is a member.
 - Uses stored Slack OAuth user token by default; env-token fallback only for development.
 - Does not rely on starred channels.
+- Tracks a per-conversation Slack timestamp watermark for incremental backfill after the first bounded pull.
+- Socket Mode and Pull Slack/backfill dedupe via Slack channel/timestamp uniqueness.
 - Persists a per-conversation pull setting:
   - `pull_all`
   - `mentions_only`
@@ -119,6 +140,7 @@ Each feed item supports:
 - react
 - close / no reply needed
 - discard / not useful
+- suppress this thread locally
 - change pull rule for the source
 
 `manual reply, observe` posts Rob's manual reply, compares it with the AI draft, and stores a learning delta.
@@ -131,10 +153,10 @@ SQLite persists:
 - conversations and pull rules
 - triage items
 - classifications and SLO status
-- AI drafts
+- AI drafts, model/prompt metadata, rationale, and bounded context snapshots
 - accepted/edited/manual replies through audit actions
 - feedback deltas
-- discard/noise signals
+- discard/noise signals and suppressed thread records
 - per-conversation preferences JSON
 
 All Slack writes are explicit UI actions. Suggested text and sent text are recorded in the audit trail.
@@ -147,11 +169,13 @@ pnpm start     # serve built frontend through the API server
 pnpm seed      # insert demo data
 pnpm ingest    # run one Slack ingestion pass from the CLI
 pnpm socket    # run the Slack Socket Mode listener
+pnpm dev:all   # run API, web, and Socket Mode together
 ```
 
 ## Current limitations
 
-- AI classification and drafts are heuristic placeholders (`heuristic-v0`) ready to be swapped for a model call.
+- First-time Pull Slack remains a bounded latest-N bootstrap; incremental pulls use Slack watermarks and limited pagination after that.
+- Slack message edits update stored item text/excerpt but do not yet regenerate LLM classifications/drafts automatically.
+- Thread suppression is Taut-local; it does not read Slack's muted-channel state.
 - Conversation names for DMs use Slack IDs unless user-profile hydration is added.
-- Ingestion currently pulls the latest N messages per conversation rather than an incremental cursor window.
 - Local SQLite token storage is appropriate for this prototype; production should encrypt tokens and add account/session boundaries.

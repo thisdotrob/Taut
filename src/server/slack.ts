@@ -1,6 +1,16 @@
 import { ProxyAgent, setGlobalDispatcher } from 'undici';
-import type { ConversationRecord } from './types';
-import { createTriageItem, listConversations as listStoredConversations, markConversationPulled, upsertConversation } from './db';
+import type { ConversationRecord, TriageItemRecord } from './types';
+import {
+  createTriageItem,
+  isThreadSuppressed,
+  listConversations as listStoredConversations,
+  listRecentLearningSignals,
+  markConversationPulled,
+  markTriageItemDeletedFromSlack,
+  updateTriageItemFromSlack,
+  upsertConversation
+} from './db';
+import { generateTriageDecision } from './llm';
 import { resolveSlackToken } from './slack-oauth';
 
 const proxyUrl = process.env.HTTPS_PROXY ?? process.env.HTTP_PROXY;
@@ -13,6 +23,7 @@ interface SlackApiResponse<T> {
   error?: string;
   response_metadata?: { next_cursor?: string; warnings?: string[] };
   warning?: string;
+  has_more?: boolean;
   [key: string]: unknown;
 }
 
@@ -39,6 +50,7 @@ interface SlackMessage {
   thread_ts?: string;
   channel?: string;
   channel_type?: string;
+  reply_count?: number;
 }
 
 interface SlackAuth {
@@ -47,6 +59,29 @@ interface SlackAuth {
   team: string;
   url: string;
   token_source: string;
+}
+
+interface SlackContextSnapshot {
+  source: {
+    slackChannelId: string;
+    name: string;
+    kind: string;
+    pullSetting: string;
+  };
+  message: SlackMessageSnapshot;
+  threadRoot: SlackMessageSnapshot | null;
+  recentThreadReplies: SlackMessageSnapshot[];
+  warnings: string[];
+  fetchedAt: string;
+}
+
+interface SlackMessageSnapshot {
+  ts: string | null;
+  threadTs: string | null;
+  user: string | null;
+  username: string | null;
+  subtype: string | null;
+  text: string;
 }
 
 type ConversationListSource = 'slack' | 'cache' | 'stored';
@@ -61,17 +96,11 @@ interface SlackIngestResult {
   warnings: string[];
 }
 
-export interface SlackMessageEvent {
-  type?: string;
-  subtype?: string;
-  channel?: string;
-  channel_type?: string;
-  user?: string;
-  username?: string;
-  bot_id?: string;
-  text?: string;
-  ts?: string;
-  thread_ts?: string;
+export interface SlackMessageEvent extends SlackMessage {
+  message?: SlackMessage;
+  previous_message?: SlackMessage;
+  deleted_ts?: string;
+  hidden?: boolean;
 }
 
 export interface SlackMessageEventIngestResult {
@@ -107,6 +136,16 @@ export class SlackRateLimitError extends Error {
 
 export function isSlackRateLimitError(error: unknown): error is SlackRateLimitError {
   return error instanceof SlackRateLimitError;
+}
+
+export function getSlackRateLimitStatuses(): Array<{ method: string; retryAfterSeconds: number; retryAt: string }> {
+  const statuses: Array<{ method: string; retryAfterSeconds: number; retryAt: string }> = [];
+  for (const [method] of rateLimitedUntilByMethod) {
+    const retryAfterSeconds = retryAfterFor(method);
+    if (!retryAfterSeconds) continue;
+    statuses.push({ method, retryAfterSeconds, retryAt: new Date(Date.now() + retryAfterSeconds * 1_000).toISOString() });
+  }
+  return statuses.sort((a, b) => a.method.localeCompare(b.method));
 }
 
 export async function slackApi<T>(method: string, params: Record<string, string | number | boolean | undefined> = {}, httpMethod: 'GET' | 'POST' = 'GET'): Promise<T> {
@@ -189,6 +228,7 @@ export async function ingestSlack(limitPerConversation = 5): Promise<SlackIngest
   const auth = await getSlackAuth();
   const conversationList = await conversationsForIngestion();
   const conversations = conversationList.conversations;
+  const warnings = [...conversationList.warnings];
   let conversationsPulled = 0;
   let itemsCreated = 0;
   let skippedByRule = 0;
@@ -206,29 +246,20 @@ export async function ingestSlack(limitPerConversation = 5): Promise<SlackIngest
       continue;
     }
 
-    const history = await conversationHistory(conversation.slack_channel_id, limitPerConversation);
+    const history = await conversationHistory(conversation.slack_channel_id, limitPerConversation, conversation.last_seen_slack_ts);
+    warnings.push(...history.warnings);
     conversationsPulled += 1;
 
-    for (const message of history) {
+    const messages = history.messages.slice().sort(compareSlackTsAscending);
+    for (const message of messages) {
       if (!shouldIngestMessage(message, auth.user_id, conversation)) continue;
       if (conversation.pull_setting === 'mentions_only' && !messageMentions(message, auth.user_id) && conversation.kind !== 'im') continue;
 
-      const permalink = await getPermalink(conversation.slack_channel_id, message.ts!);
-      const created = createTriageItem({
-        conversation,
-        slackTs: message.ts!,
-        threadTs: message.thread_ts ?? message.ts ?? null,
-        author: message.username ?? message.user ?? 'unknown',
-        authorId: message.user ?? null,
-        text: message.text ?? '',
-        permalink,
-        isDirect: conversation.kind === 'im' || conversation.kind === 'mpim',
-        mentionsUser: messageMentions(message, auth.user_id)
-      });
+      const created = await createItemFromSlackMessage(conversation, message, auth);
       if (created) itemsCreated += 1;
     }
 
-    markConversationPulled(conversation.id);
+    markConversationPulled(conversation.id, maxSlackTs(history.messages));
   }
 
   return {
@@ -238,46 +269,118 @@ export async function ingestSlack(limitPerConversation = 5): Promise<SlackIngest
     itemsCreated,
     skippedByRule,
     conversationListSource: conversationList.source,
-    warnings: conversationList.warnings
+    warnings
   };
 }
 
-export async function ingestSlackMessageEvent(message: SlackMessageEvent): Promise<SlackMessageEventIngestResult> {
-  if (message.type !== 'message') return { created: false, skipped: true, reason: 'not_message', itemId: null };
-  if (!message.channel || !message.ts || !message.text) return { created: false, skipped: true, reason: 'missing_required_fields', itemId: null };
+export async function ingestSlackMessageEvent(event: SlackMessageEvent): Promise<SlackMessageEventIngestResult> {
+  if (event.type !== 'message') return { created: false, skipped: true, reason: 'not_message', itemId: null };
+  if (!event.channel) return { created: false, skipped: true, reason: 'missing_channel', itemId: null };
+
+  if (event.subtype === 'message_deleted') {
+    const deletedTs = event.deleted_ts ?? event.previous_message?.ts;
+    if (!deletedTs) return { created: false, skipped: true, reason: 'missing_deleted_ts', itemId: null };
+    const discarded = markTriageItemDeletedFromSlack(event.channel, deletedTs);
+    return { created: false, skipped: true, reason: discarded ? 'deleted_message_discarded' : 'deleted_message_not_found', itemId: null };
+  }
+
+  if (event.subtype === 'message_changed') {
+    const changed = event.message;
+    if (!changed?.ts || typeof changed.text !== 'string') return { created: false, skipped: true, reason: 'missing_changed_message', itemId: null };
+    const updated = updateTriageItemFromSlack({ slackChannelId: event.channel, slackTs: changed.ts, text: changed.text });
+    return { created: false, skipped: true, reason: updated ? 'message_text_updated' : 'changed_message_not_found', itemId: null };
+  }
+
+  if (!event.ts || !event.text) return { created: false, skipped: true, reason: 'missing_required_fields', itemId: null };
 
   const auth = await getSlackAuth();
-  const kind = eventConversationKind(message.channel_type);
+  const kind = eventConversationKind(event.channel_type);
   const conversation = upsertConversation({
-    slackChannelId: message.channel,
-    name: await eventConversationName(message.channel, message.channel_type, message.user),
+    slackChannelId: event.channel,
+    name: await eventConversationName(event.channel, event.channel_type, event.user),
     kind,
     isMember: true
   });
 
   if (conversation.pull_setting === 'disabled') return { created: false, skipped: true, reason: 'pull_disabled', itemId: null };
-  if (!shouldIngestMessage(message, auth.user_id, conversation)) return { created: false, skipped: true, reason: 'filtered_message', itemId: null };
-  if (conversation.pull_setting === 'mentions_only' && !messageMentions(message, auth.user_id) && conversation.kind !== 'im') {
+  if (!shouldIngestMessage(event, auth.user_id, conversation)) return { created: false, skipped: true, reason: 'filtered_message', itemId: null };
+  if (conversation.pull_setting === 'mentions_only' && !messageMentions(event, auth.user_id) && conversation.kind !== 'im') {
     return { created: false, skipped: true, reason: 'mentions_only', itemId: null };
   }
 
+  const created = await createItemFromSlackMessage(conversation, event, auth);
+  markConversationPulled(conversation.id, event.ts);
+
+  if (!created) return { created: false, skipped: true, reason: 'duplicate_or_suppressed', itemId: null };
+  return { created: true, skipped: false, reason: 'created', itemId: created.id };
+}
+
+async function createItemFromSlackMessage(conversation: ConversationRecord, message: SlackMessage, auth: SlackAuth): Promise<TriageItemRecord | null> {
+  if (!message.ts || typeof message.text !== 'string') return null;
+  const threadTs = message.thread_ts ?? message.ts;
+  if (isThreadSuppressed(conversation.slack_channel_id, threadTs)) return null;
+
   const permalink = await getPermalink(conversation.slack_channel_id, message.ts);
-  const created = createTriageItem({
+  const contextSnapshot = await buildContextSnapshot(conversation, message);
+  const triage = await generateTriageDecision({
+    text: message.text,
+    sourceName: conversation.name,
+    sourceKind: conversation.kind,
+    isDirect: conversation.kind === 'im' || conversation.kind === 'mpim',
+    mentionsUser: messageMentions(message, auth.user_id),
+    contextSnapshot,
+    learningSignals: listRecentLearningSignals(6)
+  });
+
+  return createTriageItem({
     conversation,
     slackTs: message.ts,
-    threadTs: message.thread_ts ?? message.ts,
+    threadTs,
     author: message.username ?? message.user ?? 'unknown',
     authorId: message.user ?? null,
     text: message.text,
     permalink,
     isDirect: conversation.kind === 'im' || conversation.kind === 'mpim',
-    mentionsUser: messageMentions(message, auth.user_id)
+    mentionsUser: messageMentions(message, auth.user_id),
+    triage,
+    contextSnapshot
   });
+}
 
-  markConversationPulled(conversation.id);
+async function buildContextSnapshot(conversation: ConversationRecord, message: SlackMessage): Promise<SlackContextSnapshot> {
+  const warnings: string[] = [];
+  let threadRoot: SlackMessageSnapshot | null = null;
+  let recentThreadReplies: SlackMessageSnapshot[] = [];
+  const threadTs = message.thread_ts ?? null;
 
-  if (!created) return { created: false, skipped: true, reason: 'duplicate', itemId: null };
-  return { created: true, skipped: false, reason: 'created', itemId: created.id };
+  if (threadTs) {
+    try {
+      const replies = await conversationReplies(conversation.slack_channel_id, threadTs, 10);
+      const sortedReplies = replies.slice().sort(compareSlackTsAscending);
+      threadRoot = toMessageSnapshot(sortedReplies[0] ?? null);
+      recentThreadReplies = sortedReplies
+        .filter((reply) => reply.ts !== threadRoot?.ts)
+        .slice(-8)
+        .map((reply) => toMessageSnapshot(reply))
+        .filter((reply): reply is SlackMessageSnapshot => Boolean(reply));
+    } catch (error) {
+      warnings.push(error instanceof SlackRateLimitError ? `${error.message} Thread context was skipped.` : `Thread context fetch failed: ${error instanceof Error ? error.message : 'unknown error'}`);
+    }
+  }
+
+  return {
+    source: {
+      slackChannelId: conversation.slack_channel_id,
+      name: conversation.name,
+      kind: conversation.kind,
+      pullSetting: conversation.pull_setting
+    },
+    message: toMessageSnapshot(message)!,
+    threadRoot,
+    recentThreadReplies,
+    warnings,
+    fetchedAt: new Date().toISOString()
+  };
 }
 
 async function conversationsForIngestion(): Promise<{ conversations: SlackConversation[]; source: ConversationListSource; warnings: string[] }> {
@@ -360,12 +463,49 @@ function storedConversationToSlackConversation(conversation: ConversationRecord)
   };
 }
 
-async function conversationHistory(channel: string, limit: number): Promise<SlackMessage[]> {
-  const payload = await slackApi<SlackApiResponse<{ messages: SlackMessage[] }> & { messages: SlackMessage[] }>('conversations.history', {
+async function conversationHistory(channel: string, requestedLimit: number, oldestSlackTs: string | null): Promise<{ messages: SlackMessage[]; warnings: string[] }> {
+  const messages: SlackMessage[] = [];
+  const warnings: string[] = [];
+  let cursor = '';
+  let page = 0;
+  const incremental = Boolean(oldestSlackTs);
+  const pageLimit = incremental ? Math.min(Math.max(requestedLimit, 50), 100) : Math.min(Math.max(requestedLimit, 1), 50);
+  const maxPages = incremental ? maxHistoryPages() : 1;
+
+  do {
+    try {
+      const payload = await slackApi<SlackApiResponse<{ messages: SlackMessage[] }> & { messages: SlackMessage[] }>('conversations.history', {
+        channel,
+        limit: pageLimit,
+        oldest: oldestSlackTs ?? undefined,
+        inclusive: oldestSlackTs ? false : undefined,
+        cursor: cursor || undefined
+      });
+      messages.push(...payload.messages);
+      cursor = payload.response_metadata?.next_cursor ?? '';
+      page += 1;
+      if (payload.response_metadata?.warnings?.length) warnings.push(...payload.response_metadata.warnings.map((warning) => `Slack conversations.history warning for ${channel}: ${warning}`));
+      if (!payload.has_more && !cursor) break;
+    } catch (error) {
+      if (isSlackRateLimitError(error) && messages.length > 0) {
+        warnings.push(`${error.message} Continuing with ${messages.length} messages fetched before Slack paused conversations.history for ${channel}.`);
+        break;
+      }
+      throw error;
+    }
+  } while (cursor && page < maxPages);
+
+  if (cursor) warnings.push(`Reached TAUT_HISTORY_MAX_PAGES=${maxPages} while syncing ${channel}; run Pull Slack again to continue backfill.`);
+  return { messages, warnings };
+}
+
+async function conversationReplies(channel: string, threadTs: string, limit: number): Promise<SlackMessage[]> {
+  const payload = await slackApi<SlackApiResponse<{ messages: SlackMessage[] }> & { messages: SlackMessage[] }>('conversations.replies', {
     channel,
-    limit: Math.min(Math.max(limit, 1), 50)
+    ts: threadTs,
+    limit: Math.min(Math.max(limit, 1), 20)
   });
-  return payload.messages;
+  return payload.messages ?? [];
 }
 
 async function getPermalink(channel: string, messageTs: string): Promise<string | null> {
@@ -440,6 +580,14 @@ function secondsEnv(name: string, fallback: number): number {
   return parsed;
 }
 
+function maxHistoryPages(): number {
+  const raw = process.env.TAUT_HISTORY_MAX_PAGES;
+  if (!raw) return 3;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 20) return 3;
+  return parsed;
+}
+
 function shouldIngestMessage(message: SlackMessage, currentUserId: string, conversation: ConversationRecord): boolean {
   if (!message.ts || !message.text) return false;
   if (message.subtype && !['thread_broadcast'].includes(message.subtype)) return false;
@@ -480,4 +628,39 @@ function eventConversationKind(channelType: string | undefined): string {
   if (channelType === 'mpim') return 'mpim';
   if (channelType === 'group') return 'private_channel';
   return 'channel';
+}
+
+function toMessageSnapshot(message: SlackMessage | null | undefined): SlackMessageSnapshot | null {
+  if (!message) return null;
+  return {
+    ts: message.ts ?? null,
+    threadTs: message.thread_ts ?? null,
+    user: message.user ?? null,
+    username: message.username ?? null,
+    subtype: message.subtype ?? null,
+    text: truncate(message.text ?? '', 1500)
+  };
+}
+
+function compareSlackTsAscending(a: SlackMessage, b: SlackMessage): number {
+  return slackTsNumber(a.ts) - slackTsNumber(b.ts);
+}
+
+function maxSlackTs(messages: SlackMessage[]): string | null {
+  let max: SlackMessage | null = null;
+  for (const message of messages) {
+    if (!message.ts) continue;
+    if (!max || slackTsNumber(message.ts) > slackTsNumber(max.ts)) max = message;
+  }
+  return max?.ts ?? null;
+}
+
+function slackTsNumber(ts: string | null | undefined): number {
+  if (!ts) return 0;
+  const parsed = Number(ts);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function truncate(value: string, maxLength: number): string {
+  return value.length <= maxLength ? value : `${value.slice(0, maxLength - 1)}…`;
 }

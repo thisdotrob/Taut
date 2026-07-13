@@ -13,7 +13,7 @@ import type {
   TriageItemRecord,
   TriageItemWithContext
 } from './types';
-import { buildDraft, classifyMessage, compareManualReply, makeExcerpt, sloMinutesFor } from './triage';
+import { compareManualReply, heuristicTriage, makeExcerpt, sloMinutesFor, type TriageDecision } from './triage';
 
 const dbPath = process.env.TAUT_DB_PATH ?? path.resolve(process.cwd(), 'data', 'taut.db');
 mkdirSync(path.dirname(dbPath), { recursive: true });
@@ -33,6 +33,7 @@ export function migrate(): void {
       pull_setting TEXT NOT NULL DEFAULT 'pull_all' CHECK (pull_setting IN ('pull_all', 'mentions_only', 'disabled')),
       preferences_json TEXT NOT NULL DEFAULT '{}',
       last_pulled_at TEXT,
+      last_seen_slack_ts TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -49,6 +50,10 @@ export function migrate(): void {
       excerpt TEXT NOT NULL,
       permalink TEXT,
       classification TEXT NOT NULL,
+      classification_rationale TEXT,
+      triage_model TEXT,
+      triage_prompt_version TEXT,
+      context_snapshot_json TEXT,
       slo_minutes INTEGER NOT NULL,
       due_at TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'replied', 'closed', 'discarded')),
@@ -63,6 +68,9 @@ export function migrate(): void {
       draft_text TEXT NOT NULL,
       action_summary TEXT NOT NULL,
       model TEXT NOT NULL,
+      prompt_version TEXT,
+      rationale TEXT,
+      context_snapshot_json TEXT,
       created_at TEXT NOT NULL
     );
 
@@ -103,16 +111,43 @@ export function migrate(): void {
       updated_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS suppressed_threads (
+      id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+      slack_channel_id TEXT NOT NULL,
+      thread_ts TEXT NOT NULL,
+      reason TEXT,
+      created_at TEXT NOT NULL,
+      UNIQUE(slack_channel_id, thread_ts)
+    );
+
+    CREATE TABLE IF NOT EXISTS runtime_status (
+      key TEXT PRIMARY KEY,
+      value_json TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_triage_items_status_due ON triage_items(status, due_at);
     CREATE INDEX IF NOT EXISTS idx_triage_items_classification ON triage_items(classification);
     CREATE INDEX IF NOT EXISTS idx_actions_item ON item_actions(triage_item_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_slack_oauth_states_expires ON slack_oauth_states(expires_at);
+    CREATE INDEX IF NOT EXISTS idx_suppressed_threads_channel_ts ON suppressed_threads(slack_channel_id, thread_ts);
 
     UPDATE triage_items
     SET permalink = NULL
     WHERE slack_channel_id GLOB '[CDGM]DEMO*';
   `);
+
+  ensureColumn('conversations', 'last_seen_slack_ts', 'TEXT');
+  ensureColumn('triage_items', 'classification_rationale', 'TEXT');
+  ensureColumn('triage_items', 'triage_model', 'TEXT');
+  ensureColumn('triage_items', 'triage_prompt_version', 'TEXT');
+  ensureColumn('triage_items', 'context_snapshot_json', 'TEXT');
+  ensureColumn('ai_drafts', 'prompt_version', 'TEXT');
+  ensureColumn('ai_drafts', 'rationale', 'TEXT');
+  ensureColumn('ai_drafts', 'context_snapshot_json', 'TEXT');
 }
+
 
 export function getDbPath(): string {
   return dbPath;
@@ -215,9 +250,20 @@ export function updateConversationPullSettings(input: {
   return result;
 }
 
-export function markConversationPulled(conversationId: string): void {
+export function markConversationPulled(conversationId: string, latestSlackTs: string | null = null): void {
   const now = new Date().toISOString();
-  db.prepare('UPDATE conversations SET last_pulled_at = ?, updated_at = ? WHERE id = ?').run(now, now, conversationId);
+  db.prepare(`
+    UPDATE conversations
+    SET
+      last_pulled_at = @now,
+      last_seen_slack_ts = CASE
+        WHEN @latestSlackTs IS NOT NULL AND (last_seen_slack_ts IS NULL OR CAST(@latestSlackTs AS REAL) > CAST(last_seen_slack_ts AS REAL))
+          THEN @latestSlackTs
+        ELSE last_seen_slack_ts
+      END,
+      updated_at = @now
+    WHERE id = @conversationId
+  `).run({ now, latestSlackTs, conversationId });
 }
 
 export function createSlackOAuthState(redirectAfter: string | null): string {
@@ -284,24 +330,33 @@ export function createTriageItem(input: {
   permalink: string | null;
   isDirect: boolean;
   mentionsUser: boolean;
+  triage?: TriageDecision;
+  contextSnapshot?: unknown;
 }): TriageItemRecord | null {
   const exists = db.prepare('SELECT * FROM triage_items WHERE slack_channel_id = ? AND slack_ts = ?').get(input.conversation.slack_channel_id, input.slackTs) as TriageItemRecord | undefined;
   if (exists) return null;
 
-  const classification = classifyMessage(input.text, { isDirect: input.isDirect, mentionsUser: input.mentionsUser });
+  const triage = input.triage ?? heuristicTriage({
+    text: input.text,
+    sourceName: input.conversation.name,
+    isDirect: input.isDirect,
+    mentionsUser: input.mentionsUser
+  });
+  const classification = triage.classification;
   const sloMinutes = sloMinutesFor(classification);
   const createdAt = slackTsToIso(input.slackTs) ?? new Date().toISOString();
   const dueAt = new Date(new Date(createdAt).getTime() + sloMinutes * 60_000).toISOString();
   const id = randomUUID();
   const excerpt = makeExcerpt(input.text);
+  const contextSnapshotJson = safeJson(input.contextSnapshot);
 
   db.prepare(`
     INSERT INTO triage_items (
       id, conversation_id, slack_channel_id, slack_ts, thread_ts, author, author_id, text, excerpt, permalink,
-      classification, slo_minutes, due_at, status, created_at
+      classification, classification_rationale, triage_model, triage_prompt_version, context_snapshot_json, slo_minutes, due_at, status, created_at
     ) VALUES (
       @id, @conversationId, @slackChannelId, @slackTs, @threadTs, @author, @authorId, @text, @excerpt, @permalink,
-      @classification, @sloMinutes, @dueAt, 'open', @createdAt
+      @classification, @classificationRationale, @triageModel, @triagePromptVersion, @contextSnapshotJson, @sloMinutes, @dueAt, 'open', @createdAt
     )
   `).run({
     id,
@@ -315,24 +370,38 @@ export function createTriageItem(input: {
     excerpt,
     permalink: input.permalink,
     classification,
+    classificationRationale: triage.classificationRationale,
+    triageModel: triage.model,
+    triagePromptVersion: triage.promptVersion,
+    contextSnapshotJson,
     sloMinutes,
     dueAt,
     createdAt
   });
 
-  const draft = buildDraft({ classification, text: input.text, sourceName: input.conversation.name });
-  createDraft(id, draft.draftText, draft.actionSummary, 'heuristic-v0');
+  createDraft(id, triage.draftText, triage.actionSummary, triage.model, {
+    promptVersion: triage.promptVersion,
+    rationale: triage.classificationRationale,
+    contextSnapshot: input.contextSnapshot
+  });
 
   return db.prepare('SELECT * FROM triage_items WHERE id = ?').get(id) as TriageItemRecord;
 }
 
-export function createDraft(triageItemId: string, draftText: string, actionSummary: string, model: string): DraftRecord {
+export function createDraft(
+  triageItemId: string,
+  draftText: string,
+  actionSummary: string,
+  model: string,
+  metadata: { promptVersion?: string | null; rationale?: string | null; contextSnapshot?: unknown } = {}
+): DraftRecord {
   const id = randomUUID();
   const createdAt = new Date().toISOString();
+  const contextSnapshotJson = safeJson(metadata.contextSnapshot);
   db.prepare(`
-    INSERT INTO ai_drafts (id, triage_item_id, draft_text, action_summary, model, created_at)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(id, triageItemId, draftText, actionSummary, model, createdAt);
+    INSERT INTO ai_drafts (id, triage_item_id, draft_text, action_summary, model, prompt_version, rationale, context_snapshot_json, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(id, triageItemId, draftText, actionSummary, model, metadata.promptVersion ?? null, metadata.rationale ?? null, contextSnapshotJson, createdAt);
   return db.prepare('SELECT * FROM ai_drafts WHERE id = ?').get(id) as DraftRecord;
 }
 
@@ -350,7 +419,10 @@ export function listItems(status = 'open'): TriageItemWithContext[] {
       c.pull_setting AS pull_setting,
       d.id AS draft_id,
       d.draft_text AS draft_text,
-      d.action_summary AS action_summary
+      d.action_summary AS action_summary,
+      d.model AS draft_model,
+      d.prompt_version AS draft_prompt_version,
+      d.rationale AS draft_rationale
     FROM triage_items ti
     JOIN conversations c ON c.id = ti.conversation_id
     LEFT JOIN ai_drafts d ON d.id = (
@@ -374,7 +446,10 @@ export function getItem(id: string): TriageItemWithContext | undefined {
       c.pull_setting AS pull_setting,
       d.id AS draft_id,
       d.draft_text AS draft_text,
-      d.action_summary AS action_summary
+      d.action_summary AS action_summary,
+      d.model AS draft_model,
+      d.prompt_version AS draft_prompt_version,
+      d.rationale AS draft_rationale
     FROM triage_items ti
     JOIN conversations c ON c.id = ti.conversation_id
     LEFT JOIN ai_drafts d ON d.id = (
@@ -404,6 +479,90 @@ export function storeLearningDelta(triageItemId: string, aiDraft: string, manual
     INSERT INTO learning_deltas (id, triage_item_id, ai_draft, manual_reply, delta_json, created_at)
     VALUES (?, ?, ?, ?, ?, ?)
   `).run(randomUUID(), triageItemId, aiDraft, manualReply, compareManualReply(aiDraft, manualReply), new Date().toISOString());
+}
+
+export function listRecentLearningSignals(limit = 6): Array<{ classification: Classification; sourceName: string; actionType: string; actionPayloadJson: string | null; aiDraft: string | null; manualReply: string | null; deltaJson: string | null; itemText: string }> {
+  return db.prepare(`
+    SELECT
+      ti.classification,
+      c.name AS sourceName,
+      COALESCE(a.action_type, 'manual_reply_observe') AS actionType,
+      a.payload_json AS actionPayloadJson,
+      ld.ai_draft AS aiDraft,
+      ld.manual_reply AS manualReply,
+      ld.delta_json AS deltaJson,
+      ti.text AS itemText
+    FROM triage_items ti
+    JOIN conversations c ON c.id = ti.conversation_id
+    LEFT JOIN learning_deltas ld ON ld.triage_item_id = ti.id
+    LEFT JOIN item_actions a ON a.triage_item_id = ti.id AND a.created_at = (
+      SELECT MAX(created_at) FROM item_actions WHERE triage_item_id = ti.id
+    )
+    WHERE ld.id IS NOT NULL OR a.action_type IN ('edit_then_send', 'manual_reply_observe', 'send_ai_draft', 'close_no_reply', 'discard_not_useful')
+    ORDER BY COALESCE(ld.created_at, a.created_at, ti.created_at) DESC
+    LIMIT @limit
+  `).all({ limit: Math.min(Math.max(limit, 1), 20) }) as Array<{
+    classification: Classification;
+    sourceName: string;
+    actionType: string;
+    actionPayloadJson: string | null;
+    aiDraft: string | null;
+    manualReply: string | null;
+    deltaJson: string | null;
+    itemText: string;
+  }>;
+}
+
+export function updateTriageItemFromSlack(input: { slackChannelId: string; slackTs: string; text: string }): boolean {
+  const result = db.prepare(`
+    UPDATE triage_items
+    SET text = @text, excerpt = @excerpt
+    WHERE slack_channel_id = @slackChannelId AND slack_ts = @slackTs
+  `).run({ slackChannelId: input.slackChannelId, slackTs: input.slackTs, text: input.text, excerpt: makeExcerpt(input.text) });
+  return result.changes > 0;
+}
+
+export function markTriageItemDeletedFromSlack(slackChannelId: string, slackTs: string): boolean {
+  const result = db.prepare(`
+    UPDATE triage_items
+    SET status = 'discarded'
+    WHERE slack_channel_id = ? AND slack_ts = ? AND status = 'open'
+  `).run(slackChannelId, slackTs);
+  return result.changes > 0;
+}
+
+export function suppressThread(input: { conversationId: string; slackChannelId: string; threadTs: string; reason?: string | null }): void {
+  const id = randomUUID();
+  const createdAt = new Date().toISOString();
+  db.prepare(`
+    INSERT INTO suppressed_threads (id, conversation_id, slack_channel_id, thread_ts, reason, created_at)
+    VALUES (@id, @conversationId, @slackChannelId, @threadTs, @reason, @createdAt)
+    ON CONFLICT(slack_channel_id, thread_ts) DO UPDATE SET reason = excluded.reason
+  `).run({ id, conversationId: input.conversationId, slackChannelId: input.slackChannelId, threadTs: input.threadTs, reason: input.reason ?? null, createdAt });
+}
+
+export function isThreadSuppressed(slackChannelId: string, threadTs: string | null | undefined): boolean {
+  if (!threadTs) return false;
+  const row = db.prepare('SELECT 1 FROM suppressed_threads WHERE slack_channel_id = ? AND thread_ts = ?').get(slackChannelId, threadTs) as { 1: number } | undefined;
+  return Boolean(row);
+}
+
+export function setRuntimeStatus(key: string, value: unknown): void {
+  db.prepare(`
+    INSERT INTO runtime_status (key, value_json, updated_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at
+  `).run(key, JSON.stringify(value), new Date().toISOString());
+}
+
+export function getRuntimeStatus<T = unknown>(key: string): { value: T; updatedAt: string } | null {
+  const row = db.prepare('SELECT value_json, updated_at FROM runtime_status WHERE key = ?').get(key) as { value_json: string; updated_at: string } | undefined;
+  if (!row) return null;
+  try {
+    return { value: JSON.parse(row.value_json) as T, updatedAt: row.updated_at };
+  } catch {
+    return null;
+  }
 }
 
 export function computeSloSummary(): SloSummary {
@@ -525,6 +684,28 @@ export function seedDemoData(): void {
       isDirect: sample.isDirect,
       mentionsUser: sample.mentionsUser
     });
+  }
+}
+
+function ensureColumn(table: string, column: string, definition: string): void {
+  const safeTable = safeIdentifier(table);
+  const safeColumn = safeIdentifier(column);
+  const columns = db.prepare(`PRAGMA table_info(${safeTable})`).all() as Array<{ name: string }>;
+  if (columns.some((existing) => existing.name === column)) return;
+  db.exec(`ALTER TABLE ${safeTable} ADD COLUMN ${safeColumn} ${definition}`);
+}
+
+function safeIdentifier(value: string): string {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) throw new Error(`Unsafe SQL identifier: ${value}`);
+  return value;
+}
+
+function safeJson(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return null;
   }
 }
 

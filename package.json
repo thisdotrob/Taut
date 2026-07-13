@@ -14,7 +14,8 @@
     "clear-demo": "tsx src/server/cli.ts clear-demo",
     "ingest": "tsx src/server/cli.ts ingest",
     "socket": "tsx src/server/socket.ts",
-    "dev:socket": "tsx watch src/server/socket.ts"
+    "dev:socket": "tsx watch src/server/socket.ts",
+    "dev:all": "concurrently -n api,web,socket -c cyan,magenta,green \"tsx watch src/server/index.ts\" \"vite --host 0.0.0.0\" \"tsx watch src/server/socket.ts\""
   },
   "dependencies": {
     "@vitejs/plugin-react": "latest",

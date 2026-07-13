@@ -11,7 +11,7 @@ Socket Mode **does not** replace Slack OAuth. Taut still needs the OAuth user-to
 1. `SLACK_APP_TOKEN` (`xapp-...`) with `connections:write` — opens the Socket Mode WebSocket.
 2. Stored Slack OAuth user token (`xoxp-...`, stored server-side in SQLite) — lists/fetches Rob-visible conversations, creates triage items with context/permalinks, and performs explicit review-first writes.
 
-Polling/backfill (`pnpm ingest` or the **Pull Slack** UI action) remains available and should be kept. Socket events are near-real-time but not a durable queue; if the local listener is down, backfill catches up later.
+Polling/backfill (`pnpm ingest` or the **Pull Slack** UI action) remains available and should be kept. Socket events are near-real-time but not a durable queue; if the local listener is down, backfill catches up later. The UI health panel reports whether the local Socket Mode heartbeat is fresh.
 
 ## Event coverage model
 
@@ -70,6 +70,12 @@ In another terminal, run the Socket Mode listener:
 pnpm socket
 ```
 
+Or run API, web, and Socket Mode together after `SLACK_APP_TOKEN` is set:
+
+```bash
+pnpm dev:all
+```
+
 The listener will:
 
 1. Call `apps.connections.open` with `SLACK_APP_TOKEN`.
@@ -78,6 +84,7 @@ The listener will:
 4. For incoming `message.*` events, create/dedupe a Taut triage item.
 5. Fetch conversation names/permalinks through the stored Slack OAuth user token.
 6. Respect per-conversation pull rules (`pull_all`, `mentions_only`, `disabled`).
+7. Update a local heartbeat so the UI can show Socket Mode health and a second listener can fail fast instead of silently duplicating work.
 
 ## Fallback/backfill
 

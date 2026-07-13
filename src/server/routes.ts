@@ -2,6 +2,7 @@ import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { addSlackReaction, getSlackAuth, ingestSlack, isSlackRateLimitError, postSlackReply } from './slack';
+import { getSystemStatus } from './status';
 import { buildSlackOAuthStartUrl, completeSlackOAuth, disconnectSlack, getSlackConnectionStatus, tautAppUrl } from './slack-oauth';
 import {
   clearDemoData,
@@ -17,6 +18,7 @@ import {
   recordAction,
   seedDemoData,
   storeLearningDelta,
+  suppressThread,
   updateConversationPullSetting,
   updateConversationPullSettings
 } from './db';
@@ -31,8 +33,12 @@ export function createApp(): express.Express {
   app.set('trust proxy', true);
   app.use(express.json({ limit: '1mb' }));
 
-  app.get('/api/health', (_req, res) => {
-    res.json({ ok: true, dbPath: getDbPath(), time: new Date().toISOString() });
+  app.get('/api/health', (req, res) => {
+    res.json(getSystemStatus(req));
+  });
+
+  app.get('/api/status', (req, res) => {
+    res.json(getSystemStatus(req));
   });
 
   app.get('/api/slack/auth', asyncHandler(async (_req, res) => {
@@ -171,6 +177,15 @@ export function createApp(): express.Express {
     } else if (action === 'discard_not_useful') {
       markItemStatus(item.id, 'discarded');
       recordAction(item.id, action, { signal: 'not_useful' });
+    } else if (action === 'suppress_thread') {
+      suppressThread({
+        conversationId: item.conversation_id,
+        slackChannelId: item.slack_channel_id,
+        threadTs: item.thread_ts ?? item.slack_ts,
+        reason: typeof req.body?.reason === 'string' ? req.body.reason : 'Suppressed from feed item action'
+      });
+      markItemStatus(item.id, 'closed');
+      recordAction(item.id, action, { threadTs: item.thread_ts ?? item.slack_ts });
     } else if (action === 'change_pull_rule') {
       const pullSetting = req.body?.pullSetting as PullSetting | undefined;
       if (!pullSetting || !['pull_all', 'mentions_only', 'disabled'].includes(pullSetting)) {

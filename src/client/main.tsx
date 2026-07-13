@@ -23,6 +23,10 @@ interface TriageItem {
   excerpt: string;
   permalink: string | null;
   classification: Classification;
+  classification_rationale: string | null;
+  triage_model: string | null;
+  triage_prompt_version: string | null;
+  context_snapshot_json: string | null;
   slo_minutes: number;
   due_at: string;
   status: ItemStatus;
@@ -34,6 +38,36 @@ interface TriageItem {
   draft_id: string | null;
   draft_text: string | null;
   action_summary: string | null;
+  draft_model: string | null;
+  draft_prompt_version: string | null;
+  draft_rationale: string | null;
+}
+
+interface LlmStatus {
+  provider: string;
+  configured: boolean;
+  model: string;
+  promptVersion: string;
+  fallback: string | null;
+}
+
+interface SocketModeStatus {
+  configured: boolean;
+  running: boolean;
+  pid: number | null;
+  startedAt: string | null;
+  lastHeartbeatAt: string | null;
+  stale: boolean;
+}
+
+interface SystemStatus {
+  ok: boolean;
+  time: string;
+  dbPath: string;
+  slack: SlackConnectionStatus;
+  llm: LlmStatus;
+  socketMode: SocketModeStatus;
+  slackRateLimits: Array<{ method: string; retryAfterSeconds: number; retryAt: string }>;
 }
 
 interface Conversation {
@@ -111,6 +145,7 @@ function App(): React.ReactElement {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [slo, setSlo] = useState<SloSummary | null>(null);
   const [slackConnection, setSlackConnection] = useState<SlackConnectionStatus | null>(null);
+  const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
   const [statusFilter, setStatusFilter] = useState<'open' | 'all'>('open');
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
@@ -143,16 +178,17 @@ function App(): React.ReactElement {
   async function refresh(): Promise<void> {
     setLoading(true);
     try {
-      const [itemsResponse, conversationsResponse, sloResponse, slackConnectionResponse] = await Promise.all([
+      const [itemsResponse, conversationsResponse, sloResponse, systemStatusResponse] = await Promise.all([
         api<TriageItem[]>(`/api/items?status=${statusFilter}`),
         api<Conversation[]>('/api/conversations'),
         api<SloSummary>('/api/slo'),
-        api<SlackConnectionStatus>('/api/slack/connection')
+        api<SystemStatus>('/api/status')
       ]);
       setItems(itemsResponse);
       setConversations(conversationsResponse);
       setSlo(sloResponse);
-      setSlackConnection(slackConnectionResponse);
+      setSystemStatus(systemStatusResponse);
+      setSlackConnection(systemStatusResponse.slack);
     } catch (error) {
       showError(error);
     } finally {
@@ -377,6 +413,8 @@ function App(): React.ReactElement {
         ) : null}
       </section>
 
+      <SystemStatusPanel status={systemStatus} />
+
       <section className="metrics-grid" aria-label="Triage summary">
         <MetricCard label="Open items" value={String(openItems.length)} hint="Visible attention queue" />
         <MetricCard label="Overdue" value={String(slo?.overdueItems.length ?? 0)} hint="Past classification SLO" tone={(slo?.overdueItems.length ?? 0) > 0 ? 'warning' : 'default'} />
@@ -506,11 +544,12 @@ function App(): React.ReactElement {
                 <div className="reply-grid">
                   <label>
                     Edit AI draft then send
-                    <textarea value={editValue} onChange={(event) => setDraftEdits((state) => ({ ...state, [item.id]: event.target.value }))} />
+                    <textarea name={`edit-draft-${item.id}`} value={editValue} onChange={(event) => setDraftEdits((state) => ({ ...state, [item.id]: event.target.value }))} />
                   </label>
                   <label>
                     Manual reply, observe
                     <textarea
+                      name={`manual-reply-${item.id}`}
                       placeholder="Write Rob’s manual reply here; Taut posts it and stores a learning delta."
                       value={manualValue}
                       onChange={(event) => setManualReplies((state) => ({ ...state, [item.id]: event.target.value }))}
@@ -534,15 +573,40 @@ function App(): React.ReactElement {
                   <button type="button" className="ghost" onClick={() => void performAction(item, 'close_no_reply')} disabled={busy !== null}>
                     Close
                   </button>
+                  <button type="button" className="ghost" onClick={() => void performAction(item, 'suppress_thread')} disabled={busy !== null}>
+                    Suppress thread
+                  </button>
                   <button type="button" className="danger" onClick={() => void performAction(item, 'discard_not_useful')} disabled={busy !== null}>
                     Discard
                   </button>
                 </div>
 
+                <details className="audit-details">
+                  <summary>Triage audit</summary>
+                  <dl>
+                    <div>
+                      <dt>Model</dt>
+                      <dd>{item.triage_model ?? item.draft_model ?? 'unknown'}</dd>
+                    </div>
+                    <div>
+                      <dt>Prompt</dt>
+                      <dd>{item.triage_prompt_version ?? item.draft_prompt_version ?? 'unknown'}</dd>
+                    </div>
+                    <div>
+                      <dt>Rationale</dt>
+                      <dd>{item.classification_rationale ?? item.draft_rationale ?? 'No rationale stored.'}</dd>
+                    </div>
+                    <div>
+                      <dt>Context snapshot</dt>
+                      <dd>{item.context_snapshot_json ? 'Stored with Slack thread/source context' : 'Not stored for this item'}</dd>
+                    </div>
+                  </dl>
+                </details>
+
                 <footer className="card-footer">
                   <label>
                     Pull rule for this source
-                    <select value={item.pull_setting} onChange={(event) => void updatePullRule(item, event.target.value as PullSetting)} disabled={busy !== null}>
+                    <select name={`pull-rule-${item.id}`} value={item.pull_setting} onChange={(event) => void updatePullRule(item, event.target.value as PullSetting)} disabled={busy !== null}>
                       <option value="pull_all">pull_all</option>
                       <option value="mentions_only">mentions_only</option>
                       <option value="disabled">disabled</option>
@@ -562,6 +626,56 @@ function App(): React.ReactElement {
         </div>
       </section>
     </main>
+  );
+}
+
+function SystemStatusPanel(props: { status: SystemStatus | null }): React.ReactElement {
+  const status = props.status;
+  const llm = status?.llm;
+  const socket = status?.socketMode;
+  const rateLimitCount = status?.slackRateLimits.length ?? 0;
+  return (
+    <section className="panel system-status-panel" aria-labelledby="system-status-heading">
+      <div className="panel-heading compact">
+        <div>
+          <p className="eyebrow">Health</p>
+          <h2 id="system-status-heading">Local status</h2>
+        </div>
+        <span className="muted">{status ? `Checked ${formatShortDateTime(status.time)}` : 'Checking…'}</span>
+      </div>
+      <div className="status-grid">
+        <StatusPill label="API" value={status?.ok ? 'healthy' : 'checking'} tone={status?.ok ? 'good' : 'warn'} detail={status?.dbPath ? `DB ${shortPath(status.dbPath)}` : 'Loading API status'} />
+        <StatusPill label="Slack" value={connectionLabel(status?.slack ?? null)} tone={status?.slack.connected ? 'good' : 'warn'} detail={connectionDetail(status?.slack ?? null)} />
+        <StatusPill
+          label="Socket Mode"
+          value={socket?.running ? 'running' : socket?.configured ? 'configured, not running' : 'not configured'}
+          tone={socket?.running ? 'good' : socket?.configured ? 'warn' : 'neutral'}
+          detail={socket?.running ? `pid ${socket.pid ?? 'unknown'}` : socket?.stale ? 'last heartbeat is stale' : 'run pnpm socket or pnpm dev:all'}
+        />
+        <StatusPill
+          label="LLM"
+          value={llm?.configured ? `${llm.provider} · ${llm.model}` : 'heuristic fallback'}
+          tone={llm?.configured ? 'good' : 'neutral'}
+          detail={llm?.fallback ?? `Prompt ${llm?.promptVersion ?? 'unknown'}`}
+        />
+        <StatusPill
+          label="Slack rate limits"
+          value={rateLimitCount > 0 ? `${rateLimitCount} active` : 'clear'}
+          tone={rateLimitCount > 0 ? 'warn' : 'good'}
+          detail={rateLimitCount > 0 ? status!.slackRateLimits.map((limit) => `${limit.method}: ${limit.retryAfterSeconds}s`).join(' · ') : 'No remembered Slack 429 backoff'}
+        />
+      </div>
+    </section>
+  );
+}
+
+function StatusPill(props: { label: string; value: string; detail: string; tone: 'good' | 'warn' | 'neutral' }): React.ReactElement {
+  return (
+    <div className={`status-pill ${props.tone}`}>
+      <span>{props.label}</span>
+      <strong>{props.value}</strong>
+      <small>{props.detail}</small>
+    </div>
   );
 }
 
@@ -623,11 +737,11 @@ function SourceRulesPanel(props: SourceRulesPanelProps): React.ReactElement {
       <div className="source-controls" aria-label="Source filters">
         <label>
           Search sources
-          <input value={props.sourceSearch} onChange={(event) => props.onSearchChange(event.target.value)} placeholder="Search name or Slack ID" />
+          <input name="source-search" value={props.sourceSearch} onChange={(event) => props.onSearchChange(event.target.value)} placeholder="Search name or Slack ID" />
         </label>
         <label>
           Type
-          <select value={props.sourceTypeFilter} onChange={(event) => props.onTypeFilterChange(event.target.value as SourceTypeFilter)}>
+          <select name="source-type-filter" value={props.sourceTypeFilter} onChange={(event) => props.onTypeFilterChange(event.target.value as SourceTypeFilter)}>
             <option value="all">All types</option>
             <option value="channels">Channels</option>
             <option value="private_channel">Private channels</option>
@@ -636,7 +750,7 @@ function SourceRulesPanel(props: SourceRulesPanelProps): React.ReactElement {
         </label>
         <label>
           Activity
-          <select value={props.sourceActivityFilter} onChange={(event) => props.onActivityFilterChange(event.target.value as SourceActivityFilter)}>
+          <select name="source-activity-filter" value={props.sourceActivityFilter} onChange={(event) => props.onActivityFilterChange(event.target.value as SourceActivityFilter)}>
             <option value="all">All sources</option>
             <option value="open">Contributing open items</option>
             <option value="recent">Recent items</option>
@@ -667,7 +781,7 @@ function SourceRulesPanel(props: SourceRulesPanelProps): React.ReactElement {
           Pull all for selected
         </button>
         <label className="checkbox-label source-close-option">
-          <input type="checkbox" checked={props.closeOpenOnBatch} onChange={(event) => props.onCloseOpenChange(event.target.checked)} />
+          <input type="checkbox" name="close-open-on-batch" checked={props.closeOpenOnBatch} onChange={(event) => props.onCloseOpenChange(event.target.checked)} />
           Also close existing open feed items when setting selected sources to disabled or mentions-only.
         </label>
       </div>
@@ -684,7 +798,7 @@ function SourceRulesPanel(props: SourceRulesPanelProps): React.ReactElement {
           return (
             <label className={`source-row ${selected ? 'selected' : ''}`} role="row" key={source.id}>
               <span className="source-name-cell">
-                <input type="checkbox" checked={selected} onChange={() => props.onToggleSource(source.id)} aria-label={`Select ${source.name}`} />
+                <input type="checkbox" name={`select-source-${source.id}`} checked={selected} onChange={() => props.onToggleSource(source.id)} aria-label={`Select ${source.name}`} />
                 <span>
                   <strong>{source.name}</strong>
                   <small>{source.slack_channel_id}</small>
@@ -792,6 +906,15 @@ function connectionDetail(connection: SlackConnectionStatus | null): string {
   if (connection.tokenSource === 'env_bot') return 'Bot tokens only see conversations the bot can access; do not use this for Rob’s real setup.';
   if (!connection.configured) return 'OAuth client credentials are missing.';
   return 'Use Connect Slack to authorize Rob’s Slack account.';
+}
+
+function formatShortDateTime(value: string): string {
+  return new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(new Date(value));
+}
+
+function shortPath(value: string): string {
+  const parts = value.split('/').filter(Boolean);
+  return parts.length <= 2 ? value : `…/${parts.slice(-2).join('/')}`;
 }
 
 function initials(author: string): string {

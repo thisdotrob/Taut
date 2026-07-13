@@ -18,6 +18,7 @@ export interface ConversationRecord {
   pull_setting: PullSetting;
   preferences_json: string;
   last_pulled_at: string | null;
+  last_seen_slack_ts: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -42,6 +43,10 @@ export interface TriageItemRecord {
   excerpt: string;
   permalink: string | null;
   classification: Classification;
+  classification_rationale: string | null;
+  triage_model: string | null;
+  triage_prompt_version: string | null;
+  context_snapshot_json: string | null;
   slo_minutes: number;
   due_at: string;
   status: ItemStatus;
@@ -55,6 +60,9 @@ export interface DraftRecord {
   draft_text: string;
   action_summary: string;
   model: string;
+  prompt_version: string | null;
+  rationale: string | null;
+  context_snapshot_json: string | null;
   created_at: string;
 }
 
@@ -65,6 +73,36 @@ export interface TriageItemWithContext extends TriageItemRecord {
   draft_id: string | null;
   draft_text: string | null;
   action_summary: string | null;
+  draft_model: string | null;
+  draft_prompt_version: string | null;
+  draft_rationale: string | null;
+}
+
+export interface LlmStatus {
+  provider: string;
+  configured: boolean;
+  model: string;
+  promptVersion: string;
+  fallback: string | null;
+}
+
+export interface SocketModeStatus {
+  configured: boolean;
+  running: boolean;
+  pid: number | null;
+  startedAt: string | null;
+  lastHeartbeatAt: string | null;
+  stale: boolean;
+}
+
+export interface SystemStatus {
+  ok: boolean;
+  time: string;
+  dbPath: string;
+  slack: SlackConnectionStatus;
+  llm: LlmStatus;
+  socketMode: SocketModeStatus;
+  slackRateLimits: Array<{ method: string; retryAfterSeconds: number; retryAt: string }>;
 }
 
 export interface SloBucket {
