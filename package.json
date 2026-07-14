@@ -18,6 +18,7 @@
     "dev:all": "concurrently -n api,web,socket -c cyan,magenta,green \"tsx watch src/server/index.ts\" \"vite --host 0.0.0.0\" \"tsx watch src/server/socket.ts\""
   },
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.207",
     "@vitejs/plugin-react": "latest",
     "better-sqlite3": "latest",
     "concurrently": "latest",

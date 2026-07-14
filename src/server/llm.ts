@@ -1,14 +1,8 @@
-import { ProxyAgent, setGlobalDispatcher } from 'undici';
+import { query, type SDKResultMessage } from '@anthropic-ai/claude-agent-sdk';
 import type { Classification, LlmStatus } from './types';
 import { heuristicTriage, TRIAGE_PROMPT_VERSION, type TriageDecision } from './triage';
 
-const proxyUrl = process.env.HTTPS_PROXY ?? process.env.HTTP_PROXY;
-if (proxyUrl) {
-  setGlobalDispatcher(new ProxyAgent(proxyUrl));
-}
-
-const OPENAI_RESPONSES_URL = 'https://api.openai.com/v1/responses';
-const DEFAULT_OPENAI_MODEL = 'gpt-5.6';
+const DEFAULT_CLAUDE_MODEL = 'sonnet';
 const CLASSIFICATIONS: Classification[] = [
   'direct ask / decision needed',
   'team unblock / direct-report request',
@@ -38,15 +32,6 @@ export interface GenerateTriageInput {
   learningSignals?: LearningSignalForPrompt[];
 }
 
-interface OpenAIResponsePayload {
-  output_text?: string;
-  output?: Array<{
-    type?: string;
-    content?: Array<{ type?: string; text?: string }>;
-  }>;
-  error?: { message?: string };
-}
-
 interface TriageJsonPayload {
   classification: Classification;
   classificationRationale: string;
@@ -56,67 +41,55 @@ interface TriageJsonPayload {
 
 export function getLlmStatus(): LlmStatus {
   const provider = llmProvider();
-  const configured = provider === 'openai' && Boolean(process.env.OPENAI_API_KEY);
+  const configured = provider === 'claude' && Boolean(process.env.CLAUDE_CODE_OAUTH_TOKEN);
   return {
     provider,
     configured,
     model: llmModel(),
     promptVersion: TRIAGE_PROMPT_VERSION,
-    fallback: configured ? null : provider === 'openai' ? 'OPENAI_API_KEY is not set; using heuristic-v0 fallback.' : `Unsupported provider "${provider}"; using heuristic-v0 fallback.`
+    fallback: configured ? null : provider === 'claude' ? 'CLAUDE_CODE_OAUTH_TOKEN is not set; using heuristic-v0 fallback.' : `Unsupported provider "${provider}"; using heuristic-v0 fallback.`
   };
 }
 
 export async function generateTriageDecision(input: GenerateTriageInput): Promise<TriageDecision> {
   const provider = llmProvider();
-  if (provider !== 'openai') return heuristicFallback(input, `Unsupported LLM provider "${provider}".`);
-  if (!process.env.OPENAI_API_KEY) return heuristicFallback(input, 'OPENAI_API_KEY is not configured.');
+  if (provider !== 'claude') return heuristicFallback(input, `Unsupported LLM provider "${provider}".`);
+  if (!process.env.CLAUDE_CODE_OAUTH_TOKEN) return heuristicFallback(input, 'CLAUDE_CODE_OAUTH_TOKEN is not configured.');
 
   try {
-    const payload = await callOpenAI(input);
+    const payload = await callClaude(input);
     return {
       ...payload,
       model: llmModel(),
       promptVersion: TRIAGE_PROMPT_VERSION
     };
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'unknown error';
-    return heuristicFallback(input, `LLM triage failed (${message}); used heuristic fallback.`);
+    return heuristicFallback(input, `Claude triage failed (${safeLlmError(error)}); used heuristic fallback.`);
   }
 }
 
-async function callOpenAI(input: GenerateTriageInput): Promise<TriageJsonPayload> {
-  const response = await fetch(OPENAI_RESPONSES_URL, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
+async function callClaude(input: GenerateTriageInput): Promise<TriageJsonPayload> {
+  let result: SDKResultMessage | null = null;
+  for await (const message of query({
+    prompt: userPrompt(input),
+    options: {
       model: llmModel(),
-      input: [
-        { role: 'system', content: systemPrompt() },
-        { role: 'user', content: userPrompt(input) }
-      ],
-      text: {
-        format: {
-          type: 'json_schema',
-          name: 'taut_triage_decision',
-          strict: true,
-          schema: triageSchema()
-        }
-      },
-      max_output_tokens: maxOutputTokens()
-    })
-  });
+      systemPrompt: systemPrompt(),
+      outputFormat: { type: 'json_schema', schema: triageSchema() },
+      tools: [],
+      maxTurns: 1,
+      permissionMode: 'dontAsk',
+      persistSession: false,
+      settingSources: [],
+      env: { ...process.env, CLAUDE_CODE_OAUTH_TOKEN: process.env.CLAUDE_CODE_OAUTH_TOKEN }
+    }
+  })) {
+    if (message.type === 'result') result = message;
+  }
 
-  const body = (await response.json().catch(() => ({}))) as OpenAIResponsePayload;
-  if (!response.ok) throw new Error(body.error?.message ?? `OpenAI Responses API HTTP ${response.status}`);
-
-  const outputText = extractOutputText(body);
-  if (!outputText) throw new Error('OpenAI response did not include output text.');
-
-  const parsed = JSON.parse(outputText) as Partial<TriageJsonPayload>;
-  return validateTriagePayload(parsed);
+  if (!result) throw new Error('Claude Agent SDK did not return a result.');
+  if (result.subtype !== 'success') throw new Error(result.errors.join('; ') || `Claude Agent SDK returned ${result.subtype}.`);
+  return validateTriagePayload(result.structured_output as Partial<TriageJsonPayload>);
 }
 
 function systemPrompt(): string {
@@ -180,16 +153,6 @@ function triageSchema(): Record<string, unknown> {
   };
 }
 
-function extractOutputText(payload: OpenAIResponsePayload): string | null {
-  if (typeof payload.output_text === 'string') return payload.output_text;
-  for (const item of payload.output ?? []) {
-    for (const content of item.content ?? []) {
-      if (typeof content.text === 'string') return content.text;
-    }
-  }
-  return null;
-}
-
 function validateTriagePayload(payload: Partial<TriageJsonPayload>): TriageJsonPayload {
   if (!CLASSIFICATIONS.includes(payload.classification as Classification)) throw new Error('LLM returned an unsupported classification.');
   return {
@@ -211,19 +174,11 @@ function heuristicFallback(input: GenerateTriageInput, reason: string): TriageDe
 }
 
 function llmProvider(): string {
-  return (process.env.TAUT_LLM_PROVIDER ?? 'openai').trim().toLowerCase();
+  return (process.env.TAUT_LLM_PROVIDER ?? 'claude').trim().toLowerCase();
 }
 
 function llmModel(): string {
-  return (process.env.TAUT_LLM_MODEL ?? process.env.OPENAI_MODEL ?? DEFAULT_OPENAI_MODEL).trim();
-}
-
-function maxOutputTokens(): number {
-  const raw = process.env.TAUT_LLM_MAX_OUTPUT_TOKENS;
-  if (!raw) return 900;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed < 128 || parsed > 4000) return 900;
-  return Math.round(parsed);
+  return (process.env.TAUT_LLM_MODEL ?? process.env.ANTHROPIC_MODEL ?? DEFAULT_CLAUDE_MODEL).trim();
 }
 
 function stringOrFallback(value: unknown, fallback: string): string {
@@ -232,4 +187,11 @@ function stringOrFallback(value: unknown, fallback: string): string {
 
 function truncate(value: string, maxLength: number): string {
   return value.length <= maxLength ? value : `${value.slice(0, maxLength - 1)}…`;
+}
+
+function safeLlmError(error: unknown): string {
+  const message = error instanceof Error ? error.message : 'unknown error';
+  if (/auth|credential|401|403/i.test(message)) return 'authentication failed; check CLAUDE_CODE_OAUTH_TOKEN';
+  if (/rate|429|limit/i.test(message)) return 'Claude rate limit reached';
+  return 'Claude Agent SDK request failed';
 }

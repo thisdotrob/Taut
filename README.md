@@ -8,7 +8,7 @@ Taut is a lightweight AI triage feed for Slack. It intentionally avoids cloning 
 - Express + TypeScript for the local API
 - SQLite via `better-sqlite3` for persistence
 - Slack Web API ingestion/actions via Slack OAuth **user tokens** by default
-- Optional OpenAI Responses API triage/drafting with audited heuristic fallback
+- Optional Claude Agent SDK triage/drafting with audited heuristic fallback
 
 ## Run locally
 
@@ -86,15 +86,22 @@ Then run Taut and click **Connect Slack** in the UI. The resulting user token is
 Taut now calls a real LLM when configured, and falls back to `heuristic-v0` when no LLM credentials are present or a model call fails.
 
 ```bash
-OPENAI_API_KEY=...
-TAUT_LLM_PROVIDER=openai
-TAUT_LLM_MODEL=gpt-5.6
-TAUT_LLM_MAX_OUTPUT_TOKENS=900
+claude setup-token
 ```
 
-The LLM path uses the OpenAI Responses API with structured JSON output. Each triage item stores the model, prompt version, classification rationale, action summary, draft text, and a bounded Slack context snapshot for auditability. Rob's explicit actions — accepted AI drafts, edited sends, manual reply/observe, closes, discards, and learning deltas — are fed into future prompts as recent learning signals.
+Copy the token printed by that command into Taut's server-side `.env`:
 
-No OpenAI secret is committed or returned to the browser. Leave `OPENAI_API_KEY` unset to keep local heuristic-only behavior.
+```bash
+CLAUDE_CODE_OAUTH_TOKEN=...
+TAUT_LLM_PROVIDER=claude
+TAUT_LLM_MODEL=sonnet
+```
+
+`claude setup-token` requires a Claude Pro, Max, Team, or Enterprise subscription. It creates a one-year, inference-only token intended for SDK and automated environments. Taut passes it to the Claude Agent SDK and requests schema-constrained JSON; the token is never committed or returned to the browser.
+
+Each triage item stores the model, prompt version, classification rationale, action summary, draft text, and a bounded Slack context snapshot for auditability. Rob's explicit actions — accepted AI drafts, edited sends, manual reply/observe, closes, discards, and learning deltas — are fed into future prompts as recent learning signals.
+
+Leave `CLAUDE_CODE_OAUTH_TOKEN` unset to keep local heuristic-only behavior.
 
 
 ### Dev-only token fallbacks
